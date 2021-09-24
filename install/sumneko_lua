@@ -1,9 +1,0 @@
-#!/bin/sh
-mkdir ~/Builds
-git clone https://github.com/sumneko/lua-language-server ~/Builds/lua-language-server
-cd ~/Builds/lua-language-server && git pull
-git submodule update --init --recursive
-cd 3rd/luamake
-./compile/install.sh
-cd ../..
-./3rd/luamake/luamake rebuild

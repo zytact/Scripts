@@ -1,4 +1,0 @@
-#!/bin/sh
-./nvim
-./betterlockscreen
-./sumneko_lua
