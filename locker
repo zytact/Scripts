@@ -1,0 +1,5 @@
+#!/bin/sh
+
+killall -q xidlehook
+exec xidlehook --not-when-audio --not-when-fullscreen --detect-sleep --timer 300 "betterlockscreen -l dim" - & 
+exec xidlehook --not-when-audio --not-when-fullscreen --timer 420 "systemctl suspend" - 

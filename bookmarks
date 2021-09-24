@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+
+declare -A options=(
+    [GitHub]=https://github.com
+    [AniMixPlay]=https://animixplay.to
+    [Anime Scene Search Engine]=https://trace.moe
+    [MyAnimeList]=https://myanimelist.net
+    [Shadow Dragon]=https://watchshadowdragon.com
+    [DramaNice.One]=https://dramanice.one/
+    [MyDramaList]=https://mydramalist.com/
+    [Droppers Batch Unacademy]=https://unacademy.com/batch/early-excel-batch-for-droppers-jee-main-and-advanced-2022-859/ED1A5RSA
+    [Z-Library]=https://1lib.in/
+    [alecmuffett/real-world-onion-sites]=https://github.com/alecmuffett/real-world-onion-sites
+    [RadhaKrishn]=https://www.hotstar.com/in/tv/radhakrishn/1260000646
+    [Phobos DarkNet Search]=http://phobosxilamwcg75xt22id7aywkzol6q6rfl2flipcqoc4e4ahima5id.onion/
+    [Nyaa]=https://nyaa.si/
+    [Animetosho]=https://mirror.animetosho.org/
+    [AniDex]=https://anidex.info/
+    [Unacademy Schedule]=https://unacademy.com/goal/jee-main-and-advanced-preparation/TMUVD/schedule
+    [Kpopfap Jisoo]=https://thekpopfap.wordpress.com/tag/jisoo/
+    [NextDNS]=https://my.nextdns.io
+    [ASCII Generator (Image)]=https://cloudapps.herokuapp.com/imagetoascii/
+    [Text-image.com]=https://www.text-image.com/convert/ascii.html
+    [Round Image Corners]=https://round-corner.imageonline.co/
+    [Circle Crop Image]=https://crop-circle.imageonline.co/
+    [Animemelon]=https://animelon.com/
+    [MyAnimeList anime list]=https://myanimelist.net/animelist/DemonicEmperor
+    [Guide to Learning Japanese]=http://www.guidetojapanese.org/learn/category/grammar-guide/
+    [KissAsian]=https://kissasian.ac
+    [NewAsianTV]=https://newasiantv.info/
+    [TextHooker]=https://texthooker.com
+    [Index of ANIME___ Kanzaki]=https://storage.kanzaki.ru/ANIME___/
+    [Website Traffic]=https://similarweb.com
+    [Haikei]=https://app.haikei.app
+)
+
+choice=$(printf "%s\n" "${!options[@]}" | rofi -dmenu -i -l 20 -p "Choose bookmark") || exit 1
+
+do_what=$(printf "Open\nCopy" | rofi -dmenu -i -l 2 -p "Choose what to do") || exit 1
+
+if [ $do_what == "Open" ]; then
+    xdg-open "${options["$choice"]}" &
+else
+    echo ${options["$choice"]} | xclip -sel clip &
+fi

@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Will need a file to play preferrably a wav
+
+if [ $# -lt 1 ]
+then
+	echo "Time Needed in Seconds"
+	echo "Usage: $0 <seconds>"
+	echo "Example: $0 10"
+	exit 1
+fi
+
+time="$1"
+start="$SECONDS"
+s=1
+echo "Timer set for $1 seconds"
+
+function main(){
+	while [ $s -gt 0 ]
+	do
+		s="$((time - (SECONDS - start)))"
+		echo -ne "\r                         						\r"
+		echo -ne "\r$s seconds left"
+		sleep 1
+	done
+	echo -ne "\r                                      \r"
+	echo -ne "\r Times up!!!"
+	aplay -q ~/.alarm.wav
+
+
+	exit 0
+}
+
+main

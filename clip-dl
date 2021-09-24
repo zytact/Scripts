@@ -1,0 +1,13 @@
+#!/bin/bash
+echo "Youtube video url: "
+read youtube_url
+
+echo "Start time: "
+read start_time
+
+echo "Duration: "
+read duration
+
+ffmpeg -i $(youtube-dl -f 18 --get-url "$youtube_url") \
+-ss "$start_time" -t "$duration" -c:v copy -c:a copy \
+out.mkv

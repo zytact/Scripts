@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+install_rustup(){ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh; }
+
+git clone https://github.com/rust-analyzer/rust-analyzer.git ~/Builds/rust-analyzer
+cd ~/Builds/rust-analyzer && git pull
+rustup update || install_rustup
+cargo xtask install --server

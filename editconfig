@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+
+declare -A options=(
+        ["AwesomeWM rc.lua"]=~/.config/awesome/rc.lua
+        ["AwesomeWM theme.lua"]=~/.config/awesome/themes/powerarrow/theme.lua
+        ["Picom"]=~/.config/picom/picom.conf
+        ["Ranger rc.conf"]=~/.config/ranger/rc.conf
+        ["Ranger rifle.conf"]=~/.config/ranger/rifle.conf
+        ["Doom Emacs config.el"]=~/.doom.d/config.el
+        ["Doom Emacs init.el"]=~/.doom.d/init.el
+        ["Bookmarks"]=~/Documents/Code/scripts/bookmarks
+        ["Reddit Rofi"]=~/Documents/Code/scripts/reddit
+        ["Websearch"]=~/Documents/Code/scripts/websearch
+)
+
+choice=$(printf "%s\n" "${!options[@]}" | rofi -dmenu -i -l 20 -p "Choose Config to edit") || exit 1
+
+url=${options["$choice"]}
+
+emacsclient -c -a emacs "$url" &
