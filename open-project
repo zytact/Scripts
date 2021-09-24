@@ -1,0 +1,14 @@
+#!/usr/bin/env zsh
+
+ls ~/Code > ~/.code_folders
+
+while read -r p; do
+	folders+=("$p")
+done < ~/.code_folders
+
+choice=$(printf "%s\n" "${folders[@]}" | rofi -dmenu -i -l 20 -p "Choose folder") || exit 1
+
+cd ~/Code/"$choice"
+neovide --multigrid .
+
+rm ~/.code_folders

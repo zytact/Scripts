@@ -1,0 +1,5 @@
+#!/bin/sh
+mkdir ~/Builds
+git clone https://github.com/microsoft/java-debug.git ~/Builds/java-debug
+cd ~/Builds/java-debug && git pull
+./mvnw clean install
