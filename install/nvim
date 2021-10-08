@@ -1,9 +1,10 @@
 #!/bin/sh
 sudo apt update && sudo apt upgrade -y
-sudo apt-get install ninja-build gettext libtool libtool-bin autoconf automake cmake g++ pkg-config unzip curl
+sudo apt-get install ninja-build gettext libtool libtool-bin autoconf automake cmake g++ pkg-config unzip curl doxygen
 mkdir ~/Builds
 git clone https://github.com/neovim/neovim ~/Builds/neovim 
 cd ~/Builds/neovim && git pull
+sudo cp /usr/local/bin/nvim ~/Builds/nvim.backup
 make -j4
 sudo make install
 
