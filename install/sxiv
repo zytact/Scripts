@@ -1,0 +1,9 @@
+#!/bin/sh
+sudo apt update && sudo apt upgrade -y
+sudo apt install libexif-dev libxft-dev libxft2 libimlib2 libimlib2-dev
+mkdir ~/Builds
+git clone https://github.com/iam-arnab/sxiv.git ~/Builds/sxiv
+cd ~/Builds/sxiv 
+make
+sudo make install
+rm -rf ~/Builds/sxiv
