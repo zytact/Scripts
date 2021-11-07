@@ -1,4 +1,5 @@
 #!/bin/sh
 
-cd ~/dotfiles
-codium $(fzf)
+cd ~/dotfiles || exit
+fzf --preview 'bat --color "always" {}' | xargs code
+exit

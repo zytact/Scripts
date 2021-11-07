@@ -9,6 +9,6 @@ done < ~/.code_folders
 choice=$(printf "%s\n" "${folders[@]}" | rofi -dmenu -i -l 20 -p "Choose folder") || exit 1
 
 cd ~/Code/"$choice"
-neovide --multigrid .
+code .
 
 rm ~/.code_folders

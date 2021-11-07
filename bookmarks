@@ -34,6 +34,7 @@ declare -A options=(
     [Website Traffic]=https://similarweb.com
     [Haikei]=https://app.haikei.app
     [Octopii]=https://octopii.co
+    [Carbon]=https://carbon.now.sh/
 )
 
 choice=$(printf "%s\n" "${!options[@]}" | rofi -dmenu -i -l 20 -p "Choose bookmark") || exit 1
