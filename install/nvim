@@ -6,5 +6,4 @@ git clone https://github.com/neovim/neovim ~/Builds/neovim
 cd ~/Builds/neovim && git pull
 sudo cp /usr/local/bin/nvim ~/Builds/nvim.backup
 make -j4
-sudo make install
-
+sudo make install && notify-send -u "normal" Neovim "Build finished"

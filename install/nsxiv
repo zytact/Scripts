@@ -2,8 +2,7 @@
 sudo apt update && sudo apt upgrade -y
 sudo apt install libexif-dev libxft-dev libxft2 libimlib2 libimlib2-dev
 mkdir ~/Builds
-git clone https://github.com/iam-arnab/sxiv.git ~/Builds/sxiv
-cd ~/Builds/sxiv 
+git clone https://github.com/nsxiv/nsxiv.git ~/Builds/nsxiv
+cd ~/Builds/nsxiv 
 make
-sudo make install
-rm -rf ~/Builds/sxiv
+sudo make install-all
