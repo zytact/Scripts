@@ -1,0 +1,12 @@
+#!/bin/sh
+
+sudo apt update && sudo apt upgrade -y
+sudo apt install libxcb1 libxcb1 libxcb1-dev libxss-dev libxss1 libxcb-screensaver0 libxcb-screensaver0-dev
+mkdir ~/Builds
+git clone https://gitlab.com/jD91mZM2/xidlehook ~/Builds/xidlehook
+cd ~/Builds/xidlehook
+cargo build --release --bins
+sudo cp target/release/xidlehook /usr/local/bin
+sudo cp target/release/xidlehook-client /usr/local/bin
+cd ..
+rm -rf xidlehook

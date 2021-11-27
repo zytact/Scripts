@@ -1,0 +1,5 @@
+#!/bin/sh
+
+    if command -v nsxiv >/dev/null 2>&1; then
+        nsxiv -a    "$@"
+    fi
