@@ -1,0 +1,10 @@
+#!/bin/bash
+while true
+do
+  battery_level=$(upower -i /org/freedesktop/UPower/devices/battery_BAT1 | grep percentage | grep -o "[0-9]*")
+   if [ "$battery_level" -le 30 ]; then
+      notify-send "Battery Low" "Level: ${battery_level}%"
+      paplay /usr/share/sounds/freedesktop/stereo/suspend-error.oga
+  fi
+ sleep 120
+done
