@@ -1,10 +1,22 @@
 #!/bin/bash
+# while true
+# do
+#   battery_level=$(upower -i /org/freedesktop/UPower/devices/battery_BAT1 | grep percentage | grep -o "[0-9]*")
+#    if [ "$battery_level" -ge 85 ]; then
+#       notify-send "Battery Full" "Level: ${battery_level}%"
+#       paplay /usr/share/sounds/freedesktop/stereo/suspend-error.oga
+#   fi
+#  sleep 120
+# done
+
 while true
 do
-  battery_level=$(upower -i /org/freedesktop/UPower/devices/battery_BAT1 | grep percentage | grep -o "[0-9]*")
-   if [ "$battery_level" -ge 85 ]; then
-      notify-send "Battery Full" "Level: ${battery_level}%"
-      paplay /usr/share/sounds/freedesktop/stereo/suspend-error.oga
+  battery_info=$(upower -i /org/freedesktop/UPower/devices/battery_BAT1)
+  battery_state=$(echo "$battery_info" | grep state | awk '{print $2}')
+  battery_level=$(echo "$battery_info" | grep percentage | grep -o "[0-9]*")
+  if [ "$battery_state" == "charging" ] && [ "$battery_level" -ge 85 ]; then
+    notify-send "Battery Full" "Level: ${battery_level}%"
+    paplay /usr/share/sounds/freedesktop/stereo/suspend-error.oga
   fi
- sleep 120
+  sleep 120
 done
