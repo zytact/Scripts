@@ -1,4 +1,5 @@
 #!/usr/bin/python3
+
 import shutil
 import os
 
@@ -16,12 +17,10 @@ filetype = {
     'fonts': ['.otf', '.tff']
 }
 
-
 # Specify the path of the directory to be organized
 path = '/home/arnab/Downloads'
 # Get the list of all files in the specified directory
 files = os.listdir(path)
-
 
 # Define a function to organize files of a particular type into a corresponding folder
 def organize(file_type, file_folder):
