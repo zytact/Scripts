@@ -11,6 +11,7 @@ filetype = {
     'compress': ['.gz', '.xz', '.bz', '.zip', '.rar', '.7z', '.arj', '.txz'],
     'disk': ['.img', '.iso', '.toast', '.vcd'],
     'programs': ['.exe', '.AppImage', '.deb', '.rpm', '.dmg', '.bin', '.jar', '.py'],
+    'games': ['.gba'],
     'torrent': ['.torrent'],
     'fonts': ['.otf', '.tff']
 }
@@ -52,3 +53,4 @@ organize('disk', 'Disk Images')
 organize('torrent', 'Torrents')
 organize('fonts', 'Fonts')
 organize('programs', 'Programs')
+organize('games', 'Games')
