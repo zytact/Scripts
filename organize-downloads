@@ -1,6 +1,8 @@
 #!/usr/bin/python3
 import shutil
 import os
+
+# Create a dictionary with different file types and their corresponding file extensions
 filetype = {
     'video': ['.mp4', '.mkv', '.3gp', '.avi', '.vob', '.m2ts', '.mov', '.mpg4'],
     'music': ['.mp3', '.3ga', '.aifc', '.m3u', '.m3u8', '.m4p', '.m4r', '.opus'],
@@ -14,25 +16,33 @@ filetype = {
 }
 
 
+# Specify the path of the directory to be organized
 path = '/home/arnab/Downloads'
+# Get the list of all files in the specified directory
 files = os.listdir(path)
 
 
+# Define a function to organize files of a particular type into a corresponding folder
 def organize(file_type, file_folder):
     for file in files:
+        # Split the filename and get the extension
         temp = file.split('.')
         ext = '.' + temp[-1]
+        # Check if the extension matches the file type
         for i in filetype[file_type]:
             if i == ext:
+                # Check if the folder for the file type exists, then move the file into that folder
                 if os.path.isdir(os.path.join(path, file_folder)):
                     shutil.move(os.path.join(path, file),
                                 os.path.join(path, file_folder))
+                # If the folder for the file type does not exist, create the folder and then move the file
                 else:
                     os.mkdir(os.path.join(path, file_folder))
                     shutil.move(os.path.join(path, file),
                                 os.path.join(path, file_folder))
 
 
+# Organize files of different types into their corresponding folders
 organize('video', 'Video')
 organize('music', 'Music')
 organize('image', 'Images')
