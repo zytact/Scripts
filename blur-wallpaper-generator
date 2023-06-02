@@ -1,0 +1,1 @@
+convert "$1" -blur 14x10 blur.png
