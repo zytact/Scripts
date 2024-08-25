@@ -1,0 +1,11 @@
+sudo apt update
+sudo apt upgrade -y
+sudo apt autoremove -y
+flatpak update -y
+sudo snap refresh
+npm -g update
+pnpm -g update
+bun -g update
+rustup update
+cargo update
+
