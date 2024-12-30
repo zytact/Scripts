@@ -1,11 +1,10 @@
-sudo apt update
-sudo apt upgrade -y
-sudo apt autoremove -y
+#!/usr/bin/env bash
+
+sudo dnf upgrade -y
 flatpak update -y
 sudo snap refresh
-npm -g update
+sudo npm -g update
 pnpm -g update
 bun -g update
 rustup update
 cargo update
-
