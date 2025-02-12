@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 
 # Setup GitHub ssh
+sudo dnf install git -y
 ssh-keygen -t ed25519 -C "iam-arnab@outlook.com"
 echo "When you're prompted to "Enter a file in which to save the key", \nyou can press Enter to accept the default file location. \nPlease note that if you created SSH keys previously, \nssh-keygen may ask you to rewrite another key, in which case we recommend creating a custom-named SSH key. \nTo do so, type the default file location and replace id_ALGORITHM with your custom key name."
 echo "\nDo not enter Passphrase and just press enter"
 eval "$(ssh-agent -s)"
 ssh-add ~/.ssh/id_ed25519
 cat ~/.ssh/id_ed25519.pub
-echo "https://docs.github.com/en/authentication/connecting-to-github-with-ssh/adding-a-new-ssh-key-to-your-github-account"
+echo "Follow this: https://docs.github.com/en/authentication/connecting-to-github-with-ssh/adding-a-new-ssh-key-to-your-github-account"
 
 # Install Node.js with fnm
 curl -o- https://fnm.vercel.app/install | bash
