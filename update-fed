@@ -9,3 +9,8 @@ bun -g update
 rustup update
 cargo update
 uv self update
+cd ~/Projects/ghostty
+git pull
+zig build -p $HOME/.local -Doptimize=ReleaseFast
+...
+cd ~/
