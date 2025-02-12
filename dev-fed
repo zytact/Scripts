@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+
+# Install Node.js with fnm
+curl -o- https://fnm.vercel.app/install | bash
+fnm install 22
+node -v
+npm -v
+
+# Install pnpm
+npm -g install pnpm
+
+# Install Bun
+pnpm -g install bun
+
+# Setup C and C++
+sudo dnf install gcc clang gcc-c++ -y
+
+# Setup Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Setup Zig
+sudo dnf install zig -y
+
+# Setup snap
+sudo dnf install snapd -y
+sudo snap install hello-world
+
+# Install Pieces
+sudo snap install pieces-for-developers
+
+# Install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Install neovim
+sudo dnf install neovim -y

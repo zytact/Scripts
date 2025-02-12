@@ -8,3 +8,4 @@ pnpm -g update
 bun -g update
 rustup update
 cargo update
+uv self update
