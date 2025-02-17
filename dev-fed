@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 
+#Install Google Chrome
+sudo dnf install fedora-workstation-repositories
+sudo dnf config-manager setopt google-chrome.enabled=1
+sudo dnf config-manager --set-enabled google-chrome -y
+
 # Setup GitHub ssh
 sudo dnf install git -y
 ssh-keygen -t ed25519 -C "iam-arnab@outlook.com"
