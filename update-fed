@@ -4,7 +4,9 @@ sudo dnf upgrade -y
 flatpak update -y
 sudo snap refresh
 npm -g update
+pnpm self-update
 pnpm -g update
+bun upgrade
 bun -g update
 rustup update
 cargo update
