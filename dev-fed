@@ -63,18 +63,8 @@ rm -rf ~/.config/nvim/.git
 cd ~/
 git clone git@github.com:zytact/dotfiles.git
 cd dotfiles
-stow ghostty
 stow lazyvim
 stow git
 stow npm
 stow starship
 stow zed
-
-# Install ghostty
-cd ~/
-mkdir Projects && cd Projects
-git clone git@github.com:ghostty-org/ghostty.git
-cd ghostty
-sudo dnf install gtk4-devel zig libadwaita-devel
-zig build -p $HOME/.local -Doptimize=ReleaseFast
-...
