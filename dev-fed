@@ -22,7 +22,7 @@ node -v
 npm -v
 
 # Install pnpm
-curl -fsSL https://get.pnpm.io/install.sh | sh -
+npm install -g pnpm@latest-10
 
 # Install Bun
 curl -fsSL https://bun.sh/install | bash

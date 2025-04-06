@@ -4,6 +4,7 @@ sudo dnf upgrade -y
 flatpak update -y
 sudo snap refresh
 npm -g update
+npm install -g pnpm@latest-10
 pnpm -g update
 bun upgrade
 bun -g update
