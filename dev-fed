@@ -64,7 +64,7 @@ cd ~/
 git clone git@github.com:zytact/dotfiles.git
 cd dotfiles
 stow lazyvim
-stow mcphub
+cp mcphub/servers.json ~/.config/mcphub/
 stow git
 stow npm
 stow starship
