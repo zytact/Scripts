@@ -75,5 +75,5 @@ sudo dnf install glibc-langpack-ja
 locale -a | grep -i ja_jp.utf8
 sudo dnf install google-noto-cjk-fonts
 mkdir -p ~/.config/fontconfig/conf.d
-wget -P ~/.config/fontconfig/conf.d https://raw.githubusercontent.com/tatsumoto-ren/dotfiles/refs/heads/main/.config/fontconfig/conf.d/99-japanese-fonts.conf
+wget -P ~/.config/fontconfig/conf.d https://raw.githubusercontent.com/zytact/dotfiles/refs/heads/main/japanese/99-japanese-fonts.conf
 fc-cache -fv
