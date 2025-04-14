@@ -77,3 +77,9 @@ sudo dnf install google-noto-cjk-fonts
 mkdir -p ~/.config/fontconfig/conf.d
 wget -P ~/.config/fontconfig/conf.d https://raw.githubusercontent.com/zytact/dotfiles/refs/heads/main/japanese/99-japanese-fonts.conf
 fc-cache -fv
+sudo dnf install fcitx5 fcitx5-mozc fcitx5-configtool fcitx5-gtk fcitx5-qt fcitx5-autostart
+echo "Add mozc from right side to left"
+fcitx5-configtool
+echo "Uncomment GTK_IM_MODULE=fcitx and GTK_IM_MODULE=fcitx"
+sudo vi /etc/profile.d/fcitx5.sh
+echo "Set fcitx 5 in Settings > Virtual Keyboards"
