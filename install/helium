@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+
+# Script to download, extract, and install Helium browser from GitHub
+
+set -e # Exit on error
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Check if URL is provided
+if [ -z "$1" ]; then
+	echo -e "${RED}Error: GitHub tar file URL is required${NC}"
+	echo "Usage: $0 <github-tar-url>"
+	echo "Example: $0 https://github.com/user/repo/releases/download/v1.0/helium.tar.gz"
+	exit 1
+fi
+
+GITHUB_URL="$1"
+TEMP_DIR=$(mktemp -d)
+INSTALL_DIR="/opt/helium"
+DESKTOP_FILE="$HOME/.local/share/applications/helium.desktop"
+
+echo -e "${GREEN}Starting Helium installation...${NC}"
+
+# Download the tar file
+echo -e "${YELLOW}Downloading from: $GITHUB_URL${NC}"
+cd "$TEMP_DIR"
+
+# Determine the file extension from URL
+FILENAME=$(basename "$GITHUB_URL")
+curl -L -o "$FILENAME" "$GITHUB_URL"
+
+if [ $? -ne 0 ]; then
+	echo -e "${RED}Failed to download file${NC}"
+	rm -rf "$TEMP_DIR"
+	exit 1
+fi
+
+# Extract the tar file (automatically detect compression format)
+echo -e "${YELLOW}Extracting archive...${NC}"
+tar -xvf "$FILENAME"
+
+# Find the extracted folder (assuming it's the only directory in temp)
+EXTRACTED_FOLDER=$(find . -maxdepth 1 -type d ! -name "." | head -n 1)
+
+if [ -z "$EXTRACTED_FOLDER" ]; then
+	echo -e "${RED}No folder found after extraction${NC}"
+	rm -rf "$TEMP_DIR"
+	exit 1
+fi
+
+# Remove existing installation if present
+if [ -d "$INSTALL_DIR" ]; then
+	echo -e "${YELLOW}Removing existing installation...${NC}"
+	sudo rm -rf "$INSTALL_DIR"
+fi
+
+# Move to /opt/ with sudo
+echo -e "${YELLOW}Installing to $INSTALL_DIR...${NC}"
+sudo mv "$EXTRACTED_FOLDER" "$INSTALL_DIR"
+
+# Create .local/share/applications directory if it doesn't exist
+mkdir -p "$HOME/.local/share/applications"
+
+# Create the desktop entry
+echo -e "${YELLOW}Creating desktop entry...${NC}"
+cat >"$DESKTOP_FILE" <<'EOF'
+[Desktop Entry]
+Name=Helium Browser
+Exec=/opt/helium/chrome %U
+Terminal=false
+Type=Application
+Icon=/opt/helium/product_logo_256.png
+Categories=Network;WebBrowser;
+MimeType=application/pdf;application/rdf+xml;application/rss+xml;application/xhtml+xml;application/xhtml_xml;application/xml;image/gif;image/jpeg;image/png;image/webp;text/html;text/xml;x-scheme-handler/http;x-scheme-handler/https;
+StartupNotify=true
+
+EOF
+
+# Make the desktop file executable
+chmod +x "$DESKTOP_FILE"
+
+# Update desktop database
+if command -v update-desktop-database &>/dev/null; then
+	update-desktop-database "$HOME/.local/share/applications"
+fi
+
+# Cleanup
+echo -e "${YELLOW}Cleaning up temporary files...${NC}"
+rm -rf "$TEMP_DIR"
+
+echo -e "${GREEN}Installation complete!${NC}"
+echo -e "${GREEN}Desktop entry created at: $DESKTOP_FILE${NC}"
+echo -e "${GREEN}Helium installed at: $INSTALL_DIR${NC}"
