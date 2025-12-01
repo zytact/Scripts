@@ -11,3 +11,4 @@ bun -g update
 rustup update
 cargo update
 uv self update
+opencode upgrade
