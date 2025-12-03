@@ -1,7 +1,4 @@
-#!/usr/bin/env zsh
-
-CURRENT_DIR=$(pwd)
-
+#!/usr/bin/env bash
 cd ~/ || exit
 
-rm -rf "$CURRENT_DIR"
+rm -rf "$TEMP_DIR"
