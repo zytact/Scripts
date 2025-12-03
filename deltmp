@@ -1,0 +1,7 @@
+#!/usr/bin/env zsh
+
+CURRENT_DIR=$(pwd)
+
+cd ~/ || exit
+
+rm -rf "$CURRENT_DIR"

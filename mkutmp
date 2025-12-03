@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+
+TEMP_DIR=$(mktemp -d)
+
+cd "$TEMP_DIR" || exit
