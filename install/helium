@@ -70,7 +70,7 @@ echo -e "${YELLOW}Creating desktop entry...${NC}"
 cat >"$DESKTOP_FILE" <<'EOF'
 [Desktop Entry]
 Name=Helium Browser
-Exec=/opt/helium/chrome %U
+Exec=/opt/helium/helium %U
 Terminal=false
 Type=Application
 Icon=/opt/helium/product_logo_256.png
