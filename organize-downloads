@@ -1,14 +1,16 @@
 #!/usr/bin/python3
 
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
 import shutil
-import os
 
-# Create a dictionary with different file types and their corresponding file extensions
-filetype = {
-    "video": [".mp4", ".mkv", ".3gp", ".avi", ".vob", ".m2ts", ".mov", ".mpg4"],
-    "music": [".mp3", ".3ga", ".aifc", ".m3u", ".m3u8", ".m4p", ".m4r", ".opus"],
-    "image": [".jpg", ".png", ".xcf", ".jpeg", ".gif", ".tif", ".webp", ".svg", ".ico"],
-    "docs": [
+
+FILE_TYPES = {
+    "Video": [".mp4", ".mkv", ".3gp", ".avi", ".vob", ".m2ts", ".mov", ".mpg4"],
+    "Music": [".mp3", ".3ga", ".aifc", ".m3u", ".m3u8", ".m4p", ".m4r", ".opus"],
+    "Images": [".jpg", ".png", ".xcf", ".jpeg", ".gif", ".tif", ".webp", ".svg", ".ico"],
+    "Documents": [
         ".json",
         ".pdf",
         ".txt",
@@ -33,52 +35,502 @@ filetype = {
         ".srt",
         ".ass",
     ],
-    "compress": [".gz", ".xz", ".bz", ".zip", ".rar", ".7z", ".arj", ".txz"],
-    "disk": [".img", ".iso", ".toast", ".vcd"],
-    "programs": [".exe", ".AppImage", ".deb", ".rpm", ".dmg", ".bin", ".jar", ".py"],
-    "games": [".gba"],
-    "torrent": [".torrent"],
-    "fonts": [".otf", ".tff"],
-    "anki": [".apkg", ".anki2"],
+    "Compressed": [".gz", ".xz", ".bz", ".zip", ".rar", ".7z", ".arj", ".txz"],
+    "Disk Images": [".img", ".iso", ".toast", ".vcd"],
+    "Programs": [".exe", ".appimage", ".deb", ".rpm", ".dmg", ".bin", ".jar", ".py"],
+    "Games": [".gba"],
+    "Torrents": [".torrent"],
+    "Fonts": [".otf", ".ttf"],
+    "Anki Decks": [".apkg", ".anki2"],
 }
 
-# Specify the path of the directory to be organized
-path = "/home/arnab/Downloads"
-# Get the list of all files in the specified directory
-files = os.listdir(path)
+
+@dataclass
+class MoveTask:
+    source: Path
+    destination_folder: Path
 
 
-# Define a function to organize files of a particular type into a corresponding folder
-def organize(file_type, file_folder):
-    for file in files:
-        # Split the filename and get the extension
-        temp = file.split(".")
-        ext = "." + temp[-1]
-        # Check if the extension matches the file type
-        for i in filetype[file_type]:
-            if i == ext:
-                # Check if the folder for the file type exists, then move the file into that folder
-                if os.path.isdir(os.path.join(path, file_folder)):
-                    shutil.move(
-                        os.path.join(path, file), os.path.join(path, file_folder)
+@dataclass
+class MoveResult:
+    source: Path
+    destination: Path
+    ok: bool
+    renamed: bool
+    error: str = ""
+
+
+def build_extension_map(file_types):
+    extension_map = {}
+    for folder_name, extensions in file_types.items():
+        for extension in extensions:
+            extension_map[extension.lower()] = folder_name
+    return extension_map
+
+
+def collect_files(target_dir):
+    return [item for item in target_dir.iterdir() if item.is_file()]
+
+
+def categorize_files(files, extension_map):
+    categorized = {folder: [] for folder in FILE_TYPES}
+    uncategorized = []
+
+    for file_path in files:
+        extension = file_path.suffix.lower()
+        folder_name = extension_map.get(extension)
+        if folder_name:
+            categorized[folder_name].append(file_path)
+        else:
+            uncategorized.append(file_path)
+
+    return categorized, uncategorized
+
+
+def resolve_conflict(destination):
+    if not destination.exists():
+        return destination
+
+    stem = destination.stem
+    suffix = destination.suffix
+    parent = destination.parent
+    counter = 1
+    while True:
+        candidate = parent / f"{stem} ({counter}){suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def build_plan(target_dir, categorized, uncategorized, selected_categories, move_uncategorized):
+    plan = []
+    for folder_name in selected_categories:
+        destination_folder = target_dir / folder_name
+        for file_path in categorized.get(folder_name, []):
+            plan.append(MoveTask(source=file_path, destination_folder=destination_folder))
+
+    if move_uncategorized:
+        other_folder = target_dir / "Other"
+        for file_path in uncategorized:
+            plan.append(MoveTask(source=file_path, destination_folder=other_folder))
+
+    return plan
+
+
+def execute_plan(plan, dry_run=False):
+    results = []
+    for task in plan:
+        task.destination_folder.mkdir(exist_ok=True)
+        destination = resolve_conflict(task.destination_folder / task.source.name)
+
+        if dry_run:
+            results.append(
+                MoveResult(
+                    source=task.source,
+                    destination=destination,
+                    ok=True,
+                    renamed=destination.name != task.source.name,
+                )
+            )
+            continue
+
+        try:
+            shutil.move(str(task.source), str(destination))
+            results.append(
+                MoveResult(
+                    source=task.source,
+                    destination=destination,
+                    ok=True,
+                    renamed=destination.name != task.source.name,
+                )
+            )
+        except OSError as error:
+            results.append(
+                MoveResult(
+                    source=task.source,
+                    destination=destination,
+                    ok=False,
+                    renamed=False,
+                    error=str(error),
+                )
+            )
+
+    return results
+
+
+def summarize_results(results):
+    moved = sum(1 for result in results if result.ok)
+    renamed = sum(1 for result in results if result.ok and result.renamed)
+    failed = sum(1 for result in results if not result.ok)
+    return moved, renamed, failed
+
+
+def prompt_yes_no(message, default=True):
+    suffix = "[Y/n]" if default else "[y/N]"
+    while True:
+        answer = input(f"{message} {suffix}: ").strip().lower()
+        if not answer:
+            return default
+        if answer in {"y", "yes"}:
+            return True
+        if answer in {"n", "no"}:
+            return False
+        print("Please answer with y or n.")
+
+
+def cli_select_categories(categorized):
+    available = [name for name, files in categorized.items() if files]
+    if not available:
+        return []
+
+    print("\nChoose how to organize categorized files:")
+    print("- all: move every matched category")
+    print("- pick: choose specific categories")
+    print("- cancel: stop without moving files")
+
+    while True:
+        choice = input("Action [all/pick/cancel]: ").strip().lower()
+        if choice in {"all", "a"}:
+            return available
+        if choice in {"cancel", "c"}:
+            return None
+        if choice in {"pick", "p"}:
+            for index, name in enumerate(available, start=1):
+                print(f"  {index}. {name} ({len(categorized[name])})")
+            raw = input("Enter numbers separated by commas (e.g. 1,3,4): ").strip()
+            if not raw:
+                print("No selection made.")
+                continue
+            try:
+                picked_indexes = {int(item.strip()) for item in raw.split(",")}
+            except ValueError:
+                print("Invalid input. Use only numbers and commas.")
+                continue
+
+            selected = []
+            for idx in picked_indexes:
+                if idx < 1 or idx > len(available):
+                    print(f"Invalid option: {idx}")
+                    selected = []
+                    break
+                selected.append(available[idx - 1])
+            if selected:
+                return selected
+            continue
+
+        print("Please choose: all, pick, or cancel.")
+
+
+def cli_print_preview(categorized, uncategorized):
+    print("\nScan result:")
+    has_matches = False
+
+    for folder_name, items in categorized.items():
+        if not items:
+            continue
+        has_matches = True
+        sample = ", ".join(item.name for item in items[:3])
+        if len(items) > 3:
+            sample += ", ..."
+        print(f"- {folder_name}: {len(items)} file(s)")
+        print(f"  e.g. {sample}")
+
+    if uncategorized:
+        sample = ", ".join(item.name for item in uncategorized[:3])
+        if len(uncategorized) > 3:
+            sample += ", ..."
+        print(f"- Uncategorized: {len(uncategorized)} file(s)")
+        print(f"  e.g. {sample}")
+
+    if not has_matches and not uncategorized:
+        print("- No files found to organize.")
+
+
+def run_cli(target_dir, dry_run=False):
+    extension_map = build_extension_map(FILE_TYPES)
+    files = collect_files(target_dir)
+    categorized, uncategorized = categorize_files(files, extension_map)
+    cli_print_preview(categorized, uncategorized)
+
+    selected_categories = cli_select_categories(categorized)
+    if selected_categories is None:
+        print("\nCancelled. No files were moved.")
+        return 0
+
+    move_uncategorized = False
+    if uncategorized:
+        move_uncategorized = prompt_yes_no("Move uncategorized files into 'Other'?", default=False)
+
+    plan = build_plan(target_dir, categorized, uncategorized, selected_categories, move_uncategorized)
+    if not plan:
+        print("\nNothing selected. No files were moved.")
+        return 0
+
+    if not prompt_yes_no("Proceed with these changes?", default=True):
+        print("\nCancelled. No files were moved.")
+        return 0
+
+    results = execute_plan(plan, dry_run=dry_run)
+    for result in results:
+        if dry_run:
+            print(f"[DRY-RUN] {result.source.name} -> {result.destination.parent.name}/{result.destination.name}")
+        elif result.ok:
+            print(f"Moved: {result.source.name} -> {result.destination.parent.name}/{result.destination.name}")
+        else:
+            print(f"Failed: {result.source.name} ({result.error})")
+
+    moved, renamed, failed = summarize_results(results)
+    mode = "Dry-run complete" if dry_run else "Done"
+    print(f"\n{mode}: moved={moved}, renamed={renamed}, failed={failed}")
+    return 0
+
+
+def choose_directory(cli_path):
+    default_path = Path.home() / "Downloads"
+    if cli_path:
+        selected = Path(cli_path).expanduser()
+    else:
+        entered = input(f"Directory to organize [{default_path}]: ").strip()
+        selected = Path(entered).expanduser() if entered else default_path
+
+    if not selected.exists() or not selected.is_dir():
+        raise NotADirectoryError(f"Invalid directory: {selected}")
+
+    return selected
+
+
+def launch_tui(default_path, dry_run=False):
+    try:
+        from textual.app import App, ComposeResult
+        from textual.containers import Horizontal, Vertical
+        from textual.screen import ModalScreen
+        from textual.widgets import Button, Checkbox, Footer, Header, Input, RichLog, SelectionList, Static
+    except ImportError:
+        print("Textual is not installed. Install with: pip install textual")
+        return 1
+
+    class ConfirmScreen(ModalScreen):
+        def __init__(self, message):
+            super().__init__()
+            self.message = message
+
+        def compose(self):
+            with Vertical(id="confirm-dialog"):
+                yield Static(self.message)
+                with Horizontal():
+                    yield Button("Cancel", id="cancel")
+                    yield Button("Confirm", variant="success", id="confirm")
+
+        def on_button_pressed(self, event):
+            self.dismiss(event.button.id == "confirm")
+
+    class OrganizerApp(App):
+        CSS = """
+        #top { height: 3; }
+        #body { height: 1fr; }
+        #left, #right { width: 1fr; padding: 1; }
+        #preview { height: 12; border: round $primary; }
+        #log { height: 1fr; border: round $accent; }
+        #actions { height: 3; }
+        #confirm-dialog { width: 60; height: 9; border: round $warning; padding: 1 2; }
+        """
+
+        BINDINGS = [
+            ("ctrl+s", "scan", "Scan"),
+            ("ctrl+r", "run_plan", "Run"),
+            ("ctrl+q", "quit", "Quit"),
+        ]
+
+        def __init__(self, start_path, run_dry):
+            super().__init__()
+            self.target_dir = start_path
+            self.default_dry_run = run_dry
+            self.categorized = {folder: [] for folder in FILE_TYPES}
+            self.uncategorized = []
+
+        def compose(self):
+            yield Header(show_clock=False)
+            with Horizontal(id="top"):
+                yield Input(value=str(self.target_dir), placeholder="Directory path", id="path")
+                yield Button("Scan", variant="primary", id="scan")
+            with Horizontal(id="body"):
+                with Vertical(id="left"):
+                    yield Static("Categories", classes="title")
+                    yield SelectionList(id="categories")
+                    yield Checkbox("Move uncategorized to Other", id="move-uncat")
+                    yield Checkbox("Dry run", value=self.default_dry_run, id="dry-run")
+                with Vertical(id="right"):
+                    yield Static("Preview", classes="title")
+                    yield Static("Scan a directory to see matches.", id="preview")
+                    yield Static("Results", classes="title")
+                    yield RichLog(id="log", highlight=True)
+            with Horizontal(id="actions"):
+                yield Button("Run", variant="success", id="run")
+                yield Button("Quit", variant="error", id="quit")
+            yield Footer()
+
+        def on_mount(self):
+            self.scan_current_path()
+
+        def action_scan(self):
+            self.scan_current_path()
+
+        def action_run_plan(self):
+            self.try_run()
+
+        def scan_current_path(self):
+            path_input = self.query_one("#path", Input)
+            selected = Path(path_input.value).expanduser()
+            preview = self.query_one("#preview", Static)
+            categories = self.query_one("#categories", SelectionList)
+            move_uncat = self.query_one("#move-uncat", Checkbox)
+
+            if not selected.exists() or not selected.is_dir():
+                preview.update(f"Invalid directory: {selected}")
+                categories.clear_options()
+                self.query_one("#log", RichLog).write(f"Invalid directory: {selected}")
+                return
+
+            self.target_dir = selected
+            files = collect_files(self.target_dir)
+            extension_map = build_extension_map(FILE_TYPES)
+            self.categorized, self.uncategorized = categorize_files(files, extension_map)
+
+            options = []
+            lines = [f"Directory: {self.target_dir}"]
+            for folder_name, matched_files in self.categorized.items():
+                if matched_files:
+                    options.append((f"{folder_name} ({len(matched_files)})", folder_name, True))
+                    sample = ", ".join(path.name for path in matched_files[:3])
+                    if len(matched_files) > 3:
+                        sample += ", ..."
+                    lines.append(f"- {folder_name}: {len(matched_files)} | {sample}")
+
+            if self.uncategorized:
+                sample = ", ".join(path.name for path in self.uncategorized[:3])
+                if len(self.uncategorized) > 3:
+                    sample += ", ..."
+                lines.append(f"- Uncategorized: {len(self.uncategorized)} | {sample}")
+                move_uncat.disabled = False
+            else:
+                lines.append("- Uncategorized: 0")
+                move_uncat.value = False
+                move_uncat.disabled = True
+
+            if not options and not self.uncategorized:
+                lines.append("No files found to organize.")
+
+            categories.clear_options()
+            if options:
+                categories.add_options(options)
+
+            preview.update("\n".join(lines))
+            self.query_one("#log", RichLog).write(
+                f"Scanned {self.target_dir} | matches={sum(len(v) for v in self.categorized.values())}, uncategorized={len(self.uncategorized)}"
+            )
+
+        def on_button_pressed(self, event):
+            if event.button.id == "scan":
+                self.scan_current_path()
+                return
+            if event.button.id == "run":
+                self.try_run()
+                return
+            if event.button.id == "quit":
+                self.exit()
+
+        def try_run(self):
+            categories = self.query_one("#categories", SelectionList)
+            selected_categories = [
+                getattr(selection, "value", selection)
+                for selection in categories.selected
+            ]
+            move_uncategorized = self.query_one("#move-uncat", Checkbox).value
+            dry_run_value = self.query_one("#dry-run", Checkbox).value
+
+            plan = build_plan(
+                self.target_dir,
+                self.categorized,
+                self.uncategorized,
+                selected_categories,
+                move_uncategorized,
+            )
+            if not plan:
+                self.query_one("#log", RichLog).write("Nothing selected to run.")
+                return
+
+            message = (
+                f"Run plan for {len(plan)} file(s)? "
+                f"Dry run: {'yes' if dry_run_value else 'no'}"
+            )
+
+            self.push_screen(ConfirmScreen(message), lambda confirmed: self._after_confirm(confirmed, plan, dry_run_value))
+
+        def _after_confirm(self, confirmed, plan, dry_run_value):
+            if not confirmed:
+                self.query_one("#log", RichLog).write("Operation cancelled.")
+                return
+
+            log = self.query_one("#log", RichLog)
+            results = execute_plan(plan, dry_run=dry_run_value)
+            for result in results:
+                if dry_run_value:
+                    log.write(
+                        f"[DRY-RUN] {result.source.name} -> {result.destination.parent.name}/{result.destination.name}"
                     )
-                # If the folder for the file type does not exist, create the folder and then move the file
+                elif result.ok:
+                    log.write(
+                        f"Moved {result.source.name} -> {result.destination.parent.name}/{result.destination.name}"
+                    )
                 else:
-                    os.mkdir(os.path.join(path, file_folder))
-                    shutil.move(
-                        os.path.join(path, file), os.path.join(path, file_folder)
-                    )
+                    log.write(f"Failed {result.source.name}: {result.error}")
+
+            moved, renamed, failed = summarize_results(results)
+            mode = "Dry-run complete" if dry_run_value else "Done"
+            log.write(f"{mode}: moved={moved}, renamed={renamed}, failed={failed}")
+            self.scan_current_path()
+
+    app = OrganizerApp(start_path=default_path, run_dry=dry_run)
+    app.run()
+    return 0
 
 
-# Organize files of different types into their corresponding folders
-organize("video", "Video")
-organize("music", "Music")
-organize("image", "Images")
-organize("docs", "Documents")
-organize("compress", "Compressed")
-organize("disk", "Disk Images")
-organize("torrent", "Torrents")
-organize("fonts", "Fonts")
-organize("programs", "Programs")
-organize("games", "Games")
-organize("anki", "Anki Decks")
+def parse_args():
+    parser = argparse.ArgumentParser(description="Organize files by type with TUI or CLI.")
+    parser.add_argument("--path", dest="path", default=None, help="Directory to organize (default: ~/Downloads)")
+    parser.add_argument("--dry-run", action="store_true", help="Preview actions without moving files")
+    parser.add_argument("--cli", action="store_true", help="Use prompt-based CLI mode")
+    parser.add_argument("--tui", action="store_true", help="Force TUI mode")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    if args.path:
+        try:
+            target_dir = choose_directory(args.path)
+        except NotADirectoryError as error:
+            print(error)
+            return 1
+    else:
+        target_dir = Path.home() / "Downloads"
+
+    if args.cli and args.tui:
+        print("Use either --cli or --tui, not both.")
+        return 1
+
+    if args.cli:
+        if args.path is None:
+            try:
+                target_dir = choose_directory(None)
+            except NotADirectoryError as error:
+                print(error)
+                return 1
+        return run_cli(target_dir, dry_run=args.dry_run)
+
+    return launch_tui(default_path=target_dir, dry_run=args.dry_run)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
