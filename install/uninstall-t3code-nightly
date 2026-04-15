@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APPIMAGE_DIR="$HOME/.local/bin/appimages"
+APP_DIR="$APPIMAGE_DIR/t3code-nightly"
+DESKTOP_ENTRY="$HOME/.local/share/applications/t3code-nightly.desktop"
+
+echo "Uninstalling T3 Code (nightly)..."
+
+rm -rf "$APP_DIR"
+rm -f "$DESKTOP_ENTRY"
+
+update-desktop-database "$HOME/.local/share/applications/" 2>/dev/null || true
+
+echo "Done! T3 Code (nightly) uninstalled."

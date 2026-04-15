@@ -1,9 +1,58 @@
-#!/bin/sh
-sudo apt update && sudo apt upgrade -y
-sudo apt-get install ninja-build gettext libtool libtool-bin autoconf automake cmake g++ pkg-config unzip curl doxygen
-mkdir ~/Builds
-git clone https://github.com/neovim/neovim ~/Builds/neovim
-cd ~/Builds/neovim && git pull
-sudo cp /usr/local/bin/nvim ~/Builds/nvim.backup
-make -j4
-sudo make install && notify-send -u "normal" Neovim "Build finished"
+#!/usr/bin/env bash
+set -euo pipefail
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    printf "Error: '%s' is required but not installed.\n" "$1" >&2
+    exit 1
+  }
+}
+
+require_cmd curl
+require_cmd tar
+require_cmd mktemp
+require_cmd sudo
+
+ARCH="$(uname -m)"
+case "$ARCH" in
+  x86_64) NVIM_ARCH="x86_64" ;;
+  aarch64|arm64) NVIM_ARCH="arm64" ;;
+  *)
+    printf "Unsupported architecture: %s\n" "$ARCH" >&2
+    exit 1
+    ;;
+esac
+
+URL="https://github.com/neovim/neovim/releases/latest/download/nvim-linux-${NVIM_ARCH}.tar.gz"
+TMP_DIR="$(mktemp -d)"
+TARBALL="${TMP_DIR}/nvim-linux-${NVIM_ARCH}.tar.gz"
+EXTRACT_DIR="${TMP_DIR}/extract"
+INSTALL_DIR="/opt/nvim-linux-${NVIM_ARCH}"
+BIN_LINK="/usr/local/bin/nvim"
+
+cleanup() {
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+
+printf "Downloading: %s\n" "$URL"
+curl -fL "$URL" -o "$TARBALL"
+
+mkdir -p "$EXTRACT_DIR"
+tar -xzf "$TARBALL" -C "$EXTRACT_DIR"
+
+EXTRACTED_ROOT="${EXTRACT_DIR}/nvim-linux-${NVIM_ARCH}"
+if [ ! -d "$EXTRACTED_ROOT" ]; then
+  printf "Error: expected extracted directory not found: %s\n" "$EXTRACTED_ROOT" >&2
+  exit 1
+fi
+
+printf "Installing to: %s\n" "$INSTALL_DIR"
+sudo rm -rf "$INSTALL_DIR"
+sudo mv "$EXTRACTED_ROOT" "$INSTALL_DIR"
+
+printf "Linking binary: %s -> %s/bin/nvim\n" "$BIN_LINK" "$INSTALL_DIR"
+sudo ln -sfn "${INSTALL_DIR}/bin/nvim" "$BIN_LINK"
+
+printf "Installed: "
+nvim --version | sed -n '1p'

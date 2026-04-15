@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="pingdotgg/t3code"
+APPIMAGE_DIR="$HOME/.local/bin/appimages"
+APP_DIR="$APPIMAGE_DIR/t3code-nightly"
+DESKTOP_ENTRY="$HOME/.local/share/applications/t3code-nightly.desktop"
+
+get_latest_nightly() {
+    gh api repos/$REPO/releases | jq -r '.[] | select(.prerelease == true) | .tag_name' | head -1
+}
+
+download_appimage() {
+    local version="$1"
+    local version_num="${version#nightly-}"
+    version_num="${version_num#v}"
+    local appimage_url="https://github.com/$REPO/releases/download/${version}/T3-Code-${version_num}-x86_64.AppImage"
+
+    echo "Downloading T3 Code ${version}..."
+    curl -L --progress-bar -o "/tmp/T3-Code-${version_num}-x86_64.AppImage" "$appimage_url"
+
+    echo "Making executable..."
+    chmod +x "/tmp/T3-Code-${version_num}-x86_64.AppImage"
+
+    echo "Moving to $APP_DIR..."
+    mkdir -p "$APP_DIR"
+    rm -f "$APP_DIR/t3code-nightly.AppImage"
+    mv "/tmp/T3-Code-${version_num}-x86_64.AppImage" "$APP_DIR/t3code-nightly.AppImage"
+}
+
+extract_and_integrate() {
+    local appimage_path="$APP_DIR/t3code-nightly.AppImage"
+
+    echo "Extracting AppImage metadata..."
+    cd "$APP_DIR"
+    ./t3code-nightly.AppImage --appimage-extract
+
+    local squash_dir="$APP_DIR/squashfs-root"
+
+    local desktop_file=""
+    for f in "$squash_dir"/*.desktop; do
+        if [[ -f "$f" ]]; then
+            desktop_file="$f"
+            break
+        fi
+    done
+
+    if [[ -n "$desktop_file" ]]; then
+        echo "Installing desktop entry..."
+        cp "$desktop_file" "$DESKTOP_ENTRY"
+
+        sed -i "s|Exec=.*|Exec=$APP_DIR/t3code-nightly.AppImage|g" "$DESKTOP_ENTRY"
+
+        local icon_file=""
+        for icon in "$squash_dir/t3code.png" "$squash_dir/.DirIcon" "$squash_dir/usr/share/icons/hicolor/1024x1024/apps/t3code.png"; do
+            if [[ -f "$icon" ]]; then
+                cp "$icon" "$APP_DIR/icon.png"
+                icon_file="icon.png"
+                break
+            fi
+        done
+
+        if [[ -n "$icon_file" ]]; then
+            sed -i "s|Icon=.*|Icon=$APP_DIR/icon.png|g" "$DESKTOP_ENTRY"
+        fi
+    fi
+
+    echo "Refreshing desktop database..."
+    update-desktop-database "$HOME/.local/share/applications/" 2>/dev/null || true
+
+    echo "Cleaning up squashfs-root..."
+    rm -rf "$squash_dir"
+
+    echo ""
+    echo "Done! T3 Code (nightly) installed."
+    echo "You can now find it in your app launcher."
+}
+
+main() {
+    echo "Installing T3 Code (nightly)..."
+    echo ""
+
+    local version
+    version=$(get_latest_nightly)
+    echo "Latest nightly version: $version"
+
+    download_appimage "$version"
+    extract_and_integrate
+}
+
+main
