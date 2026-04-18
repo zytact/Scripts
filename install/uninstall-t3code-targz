@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+INSTALL_DIR="/opt/t3code"
+DESKTOP_ENTRY="$HOME/.local/share/applications/t3code.desktop"
+ICON_SOURCE="$HOME/.local/share/icons/t3code.png"
+BIN_LINK="/usr/local/bin/t3code"
+
+need_sudo() {
+    echo "This uninstall removes files from $INSTALL_DIR and $BIN_LINK"
+    if [[ -t 0 ]]; then
+        if sudo -v; then
+            return 0
+        fi
+    fi
+
+    echo "Run this script in a terminal and approve sudo when prompted."
+    exit 1
+}
+
+main() {
+    echo "Uninstalling T3 Code..."
+    echo ""
+
+    need_sudo
+
+    if [[ -d "$INSTALL_DIR" ]]; then
+        echo "Removing $INSTALL_DIR..."
+        sudo rm -rf "$INSTALL_DIR"
+    fi
+
+    if [[ -L "$BIN_LINK" || -e "$BIN_LINK" ]]; then
+        echo "Removing symlink $BIN_LINK..."
+        sudo rm -f "$BIN_LINK"
+    fi
+
+    if [[ -f "$DESKTOP_ENTRY" ]]; then
+        echo "Removing desktop entry..."
+        rm -f "$DESKTOP_ENTRY"
+    fi
+
+    if [[ -f "$ICON_SOURCE" ]]; then
+        echo "Removing cached icon..."
+        rm -f "$ICON_SOURCE"
+    fi
+
+    update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+
+    echo ""
+    echo "Done. T3 Code has been removed."
+}
+
+main "$@"

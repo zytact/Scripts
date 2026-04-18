@@ -47,7 +47,7 @@ extract_and_integrate() {
         echo "Installing desktop entry..."
         cp "$desktop_file" "$DESKTOP_ENTRY"
 
-        sed -i "s|Exec=.*|Exec=$APP_DIR/t3code.AppImage|g" "$DESKTOP_ENTRY"
+        sed -i "s|Exec=.*|Exec=$APP_DIR/t3code.AppImage --ozone-platform=x11|g" "$DESKTOP_ENTRY"
 
         local icon_file=""
         for icon in "$squash_dir/t3code.png" "$squash_dir/.DirIcon" "$squash_dir/usr/share/icons/hicolor/1024x1024/apps/t3code.png"; do
@@ -74,16 +74,65 @@ extract_and_integrate() {
     echo "You can now find it in your app launcher."
 }
 
-main() {
-    echo "Installing T3 Code (stable)..."
-    echo ""
+install_from_appimage() {
+    local appimage_path="$1"
 
-    local version
-    version=$(get_latest_stable)
-    echo "Latest stable version: $version"
+    echo "Using local AppImage: $appimage_path"
 
-    download_appimage "$version"
+    if [[ ! -f "$appimage_path" ]]; then
+        echo "Error: File not found: $appimage_path"
+        exit 1
+    fi
+
+    echo "Making executable..."
+    chmod +x "$appimage_path"
+
+    echo "Copying to $APP_DIR..."
+    mkdir -p "$APP_DIR"
+    rm -f "$APP_DIR/t3code.AppImage"
+    cp "$appimage_path" "$APP_DIR/t3code.AppImage"
+
     extract_and_integrate
 }
 
-main
+get_version_from_arg() {
+    local arg="$1"
+
+    if [[ "$arg" == *.AppImage && -f "$arg" ]]; then
+        echo "local"
+    elif [[ "$arg" =~ ^v[0-9] ]]; then
+        echo "version"
+    else
+        echo "version"
+    fi
+}
+
+main() {
+    local arg="${1:-}"
+
+    echo "Installing T3 Code (stable)..."
+    echo ""
+
+    if [[ -n "$arg" && "${arg%.AppImage}" != "$arg" && -f "$arg" ]]; then
+        install_from_appimage "$arg"
+        return
+    fi
+
+    if [[ -n "$arg" ]]; then
+        local version="$arg"
+        if [[ ! "$version" =~ ^v ]]; then
+            version="v$version"
+        fi
+        echo "Installing version: $version"
+        download_appimage "$version"
+    else
+        local version
+        version=$(get_latest_stable)
+        echo "Latest stable version: $version"
+        download_appimage "$version"
+    fi
+
+    extract_and_integrate
+}
+
+main "$@"

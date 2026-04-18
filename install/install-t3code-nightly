@@ -76,16 +76,25 @@ extract_and_integrate() {
     echo "You can now find it in your app launcher."
 }
 
-main() {
-    echo "Installing T3 Code (nightly)..."
-    echo ""
+install_from_appimage() {
+    local appimage_path="$1"
 
-    local version
-    version=$(get_latest_nightly)
-    echo "Latest nightly version: $version"
+    echo "Using local AppImage: $appimage_path"
 
-    download_appimage "$version"
-    extract_and_integrate
+    if [[ ! -f "$appimage_path" ]]; then
+        echo "Error: File not found: $appimage_path"
+        exit 1
+    fi
+
+    echo "Making executable..."
+    chmod +x "$appimage_path"
+
+    echo "Copying to $APP_DIR..."
+    mkdir -p "$APP_DIR"
+    rm -f "$APP_DIR/t3code-nightly.AppImage"
+    cp "$appimage_path" "$APP_DIR/t3code-nightly.AppImage"
+
+extract_and_integrate
 }
 
-main
+main "$@"

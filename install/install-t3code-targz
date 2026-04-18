@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+INSTALL_DIR="/opt/t3code"
+DESKTOP_ENTRY="$HOME/.local/share/applications/t3code.desktop"
+ICON_SOURCE="$HOME/.local/share/icons/t3code.png"
+DESKTOP_DB="$HOME/.local/share/applications"
+ICON_URL="https://github.com/pingdotgg/t3code/raw/main/assets/prod/black-universal-1024.png"
+
+need_sudo() {
+    echo "This script needs sudo to install to $INSTALL_DIR and create symlink in /usr/local/bin"
+    if [[ -t 0 ]]; then
+        if sudo -v; then
+            return 0
+        fi
+    fi
+
+    echo "Run this script in a terminal and approve sudo when prompted."
+    exit 1
+}
+
+download_icon() {
+    local out_icon="$1"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$ICON_URL" -o "$out_icon"
+        return 0
+    fi
+
+    if command -v wget >/dev/null 2>&1; then
+        wget -qO "$out_icon" "$ICON_URL"
+        return 0
+    fi
+
+    echo "Error: curl or wget is required to download the desktop icon"
+    return 1
+}
+
+install_from_targz() {
+    local targz_path="$1"
+
+    if [[ ! -f "$targz_path" ]]; then
+        echo "Error: File not found: $targz_path"
+        exit 1
+    fi
+
+    local dirname
+    dirname=$(basename "$targz_path")
+    dirname="${dirname%.tar.gz}"
+
+    echo "Installing T3 Code from $targz_path..."
+    echo ""
+
+    need_sudo
+
+    echo "Extracting to $INSTALL_DIR..."
+    sudo rm -rf "$INSTALL_DIR"
+    sudo tar -xzf "$targz_path" -C /opt
+    sudo mv "/opt/$dirname" "$INSTALL_DIR"
+
+    echo "Making executable..."
+    sudo chmod +x "$INSTALL_DIR/t3code"
+
+    echo "Creating symlink..."
+    sudo ln -sf "$INSTALL_DIR/t3code" /usr/local/bin/t3code
+
+    echo "Downloading icon..."
+    mkdir -p "$HOME/.local/share/icons"
+    download_icon "$ICON_SOURCE"
+
+    echo "Creating desktop entry..."
+    mkdir -p "$DESKTOP_DB"
+
+cat > "$DESKTOP_ENTRY" <<EOF
+[Desktop Entry]
+Type=Application
+Name=T3 Code
+Comment=AI-powered code editor
+Exec=$INSTALL_DIR/t3code --ozone-platform=x11 %F
+Icon=$ICON_SOURCE
+Terminal=false
+StartupNotify=true
+StartupWMClass=t3 code (alpha)
+Categories=Development;IDE;TextEditor;
+MimeType=text/plain;text/x-chdr;text/x-csrc;text/x-cxxsrc;text/x-java;text/x-python;text/x-script;
+EOF
+
+    echo "Refreshing desktop database..."
+    update-desktop-database "$DESKTOP_DB" 2>/dev/null || true
+
+    echo ""
+    echo "Done! T3 Code installed to $INSTALL_DIR"
+    echo "You can now find it in your app launcher."
+    echo ""
+    echo "Run with: $INSTALL_DIR/t3code"
+    echo "Or:      t3code"
+}
+
+main() {
+    local arg="${1:-}"
+
+    if [[ -z "$arg" ]]; then
+        echo "Usage: $0 <path-to-tar.gz>"
+        echo ""
+        echo "Example:"
+        echo "  $0 ./T3-Code-0.0.19-x64.tar.gz"
+        exit 1
+    fi
+
+    install_from_targz "$arg"
+}
+
+main "$@"
