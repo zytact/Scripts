@@ -5,6 +5,82 @@ REPO="pingdotgg/t3code"
 APPIMAGE_DIR="$HOME/.local/bin/appimages"
 APP_DIR="$APPIMAGE_DIR/t3code"
 DESKTOP_ENTRY="$HOME/.local/share/applications/t3code.desktop"
+ICON_SOURCE="$HOME/.local/share/icons/t3code.png"
+ICON_URL="https://github.com/pingdotgg/t3code/raw/main/assets/prod/black-universal-1024.png"
+
+detect_distro() {
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        case "$ID" in
+            debian|ubuntu|linuxmint|pop)
+                echo "debian"
+                ;;
+            fedora|rhel|centos|almalinux|rocky)
+                echo "fedora"
+                ;;
+            *)
+                echo "unknown"
+                ;;
+        esac
+    else
+        echo "unknown"
+    fi
+}
+
+ensure_gh() {
+    if command -v gh >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo "GitHub CLI (gh) is required to install T3 Code."
+    read -r -p "Install gh now? [y/N] " answer
+
+    case "$answer" in
+        y|Y|yes|YES)
+            local distro
+            distro=$(detect_distro)
+
+            case "$distro" in
+                debian)
+                    (type -p wget >/dev/null || (sudo apt update && sudo apt install wget -y)) \
+                    && (type -p curl >/dev/null || sudo apt install curl -y) \
+                    && sudo mkdir -p -m 755 /etc/apt/keyrings \
+                    && out=$(mktemp) && wget -nv -O$out https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+                    && cat $out | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+                    && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+                    && sudo mkdir -p -m 755 /etc/apt/sources.list.d \
+                    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+                    && sudo apt update \
+                    && sudo apt install gh -y
+                    ;;
+                fedora)
+                    (type -p wget >/dev/null || sudo dnf install wget -y) \
+                    && (type -p curl >/dev/null || sudo dnf install curl -y) \
+                    && sudo dnf install dnf5-plugins \
+                    && sudo dnf config-manager addrepo --from-repofile=https://cli.github.com/packages/rpm/gh-cli.repo \
+                    && sudo dnf install gh --repo gh-cli
+                    ;;
+                *)
+                    echo "Error: Unsupported distribution. gh installation is supported on Debian/Ubuntu and Fedora/RHEL-based systems."
+                    exit 1
+                    ;;
+            esac
+            ;;
+        *)
+            echo "Skipping install because this script needs gh to fetch T3 Code releases."
+            exit 1
+            ;;
+    esac
+}
+
+ensure_gh_login() {
+    if gh auth status >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo "Signing in to GitHub CLI..."
+    gh auth login
+}
 
 get_latest_stable() {
     gh api repos/$REPO/releases | jq -r '.[] | select(.prerelease == false) | .tag_name' | head -1
@@ -24,6 +100,23 @@ download_appimage() {
     mkdir -p "$APP_DIR"
     rm -f "$APP_DIR/t3code.AppImage"
     mv "/tmp/T3-Code-${version#v}-x86_64.AppImage" "$APP_DIR/t3code.AppImage"
+}
+
+download_icon() {
+    local out_icon="$1"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$ICON_URL" -o "$out_icon"
+        return 0
+    fi
+
+    if command -v wget >/dev/null 2>&1; then
+        wget -qO "$out_icon" "$ICON_URL"
+        return 0
+    fi
+
+    echo "Error: curl or wget is required to download the desktop icon"
+    return 1
 }
 
 extract_and_integrate() {
@@ -49,18 +142,10 @@ extract_and_integrate() {
 
         sed -i "s|Exec=.*|Exec=$APP_DIR/t3code.AppImage --ozone-platform=x11|g" "$DESKTOP_ENTRY"
 
-        local icon_file=""
-        for icon in "$squash_dir/t3code.png" "$squash_dir/.DirIcon" "$squash_dir/usr/share/icons/hicolor/1024x1024/apps/t3code.png"; do
-            if [[ -f "$icon" ]]; then
-                cp "$icon" "$APP_DIR/icon.png"
-                icon_file="icon.png"
-                break
-            fi
-        done
+        mkdir -p "$HOME/.local/share/icons"
+        download_icon "$ICON_SOURCE"
 
-        if [[ -n "$icon_file" ]]; then
-            sed -i "s|Icon=.*|Icon=$APP_DIR/icon.png|g" "$DESKTOP_ENTRY"
-        fi
+        sed -i "s|Icon=.*|Icon=$ICON_SOURCE|g" "$DESKTOP_ENTRY"
     fi
 
     echo "Refreshing desktop database..."
@@ -117,6 +202,9 @@ main() {
         install_from_appimage "$arg"
         return
     fi
+
+    ensure_gh
+    ensure_gh_login
 
     if [[ -n "$arg" ]]; then
         local version="$arg"

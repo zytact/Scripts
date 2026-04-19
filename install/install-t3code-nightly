@@ -142,7 +142,7 @@ extract_and_integrate() {
         echo "Installing desktop entry..."
         cp "$desktop_file" "$DESKTOP_ENTRY"
 
-        sed -i "s|Exec=.*|Exec=$APP_DIR/t3code-nightly.AppImage|g" "$DESKTOP_ENTRY"
+        sed -i "s|Exec=.*|Exec=$APP_DIR/t3code-nightly.AppImage --ozone-platform=x11|g" "$DESKTOP_ENTRY"
 
         mkdir -p "$HOME/.local/share/icons"
         download_icon "$ICON_SOURCE"

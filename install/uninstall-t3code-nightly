@@ -4,11 +4,13 @@ set -euo pipefail
 APPIMAGE_DIR="$HOME/.local/bin/appimages"
 APP_DIR="$APPIMAGE_DIR/t3code-nightly"
 DESKTOP_ENTRY="$HOME/.local/share/applications/t3code-nightly.desktop"
+ICON_SOURCE="$HOME/.local/share/icons/t3code.png"
 
 echo "Uninstalling T3 Code (nightly)..."
 
 rm -rf "$APP_DIR"
 rm -f "$DESKTOP_ENTRY"
+rm -f "$ICON_SOURCE"
 
 update-desktop-database "$HOME/.local/share/applications/" 2>/dev/null || true
 
