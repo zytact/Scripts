@@ -8,6 +8,25 @@ DESKTOP_ENTRY="$HOME/.local/share/applications/t3code-nightly.desktop"
 ICON_SOURCE="$HOME/.local/share/icons/t3code.png"
 ICON_URL="https://github.com/pingdotgg/t3code/raw/main/assets/prod/black-universal-1024.png"
 
+detect_distro() {
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        case "$ID" in
+            debian|ubuntu|linuxmint|pop)
+                echo "debian"
+                ;;
+            fedora|rhel|centos|almalinux|rocky)
+                echo "fedora"
+                ;;
+            *)
+                echo "unknown"
+                ;;
+        esac
+    else
+        echo "unknown"
+    fi
+}
+
 ensure_gh() {
     if command -v gh >/dev/null 2>&1; then
         return 0
@@ -18,15 +37,34 @@ ensure_gh() {
 
     case "$answer" in
         y|Y|yes|YES)
-            (type -p wget >/dev/null || (sudo apt update && sudo apt install wget -y)) \
-	&& sudo mkdir -p -m 755 /etc/apt/keyrings \
-	&& out=$(mktemp) && wget -nv -O$out https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-	&& cat $out | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
-	&& sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
-	&& sudo mkdir -p -m 755 /etc/apt/sources.list.d \
-	&& echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
-	&& sudo apt update \
-	&& sudo apt install gh -y
+            local distro
+            distro=$(detect_distro)
+
+            case "$distro" in
+                debian)
+                    (type -p wget >/dev/null || (sudo apt update && sudo apt install wget -y)) \
+                    && (type -p curl >/dev/null || sudo apt install curl -y) \
+                    && sudo mkdir -p -m 755 /etc/apt/keyrings \
+                    && out=$(mktemp) && wget -nv -O$out https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+                    && cat $out | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+                    && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+                    && sudo mkdir -p -m 755 /etc/apt/sources.list.d \
+                    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+                    && sudo apt update \
+                    && sudo apt install gh -y
+                    ;;
+                fedora)
+                    (type -p wget >/dev/null || sudo dnf install wget -y) \
+                    && (type -p curl >/dev/null || sudo dnf install curl -y) \
+                    && sudo dnf install dnf5-plugins \
+                    && sudo dnf config-manager addrepo --from-repofile=https://cli.github.com/packages/rpm/gh-cli.repo \
+                    && sudo dnf install gh --repo gh-cli
+                    ;;
+                *)
+                    echo "Error: Unsupported distribution. gh installation is supported on Debian/Ubuntu and Fedora/RHEL-based systems."
+                    exit 1
+                    ;;
+            esac
             ;;
         *)
             echo "Skipping install because this script needs gh to fetch T3 Code nightly releases."
