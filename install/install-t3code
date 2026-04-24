@@ -87,6 +87,32 @@ get_latest_stable() {
     gh api repos/$REPO/releases | jq -r '.[] | select(.prerelease == false) | .tag_name' | head -1
 }
 
+get_stable_versions() {
+    gh api repos/$REPO/releases | jq -r '.[] | select(.prerelease == false) | .tag_name'
+}
+
+select_stable_version() {
+    local versions=()
+    local selected
+
+    mapfile -t versions < <(get_stable_versions)
+
+    if [[ ${#versions[@]} -eq 0 ]]; then
+        echo "Error: Could not find any stable releases." >&2
+        return 1
+    fi
+
+    echo "Select a stable version:" >&2
+    PS3="Enter choice number: "
+    select selected in "${versions[@]}"; do
+        if [[ -n "${selected:-}" ]]; then
+            echo "$selected"
+            return 0
+        fi
+        echo "Invalid selection. Try again." >&2
+    done
+}
+
 download_appimage() {
     local version="$1"
     local appimage_url="https://github.com/$REPO/releases/download/${version}/T3-Code-${version#v}-x86_64.AppImage"
@@ -181,8 +207,41 @@ get_version_from_arg() {
     fi
 }
 
+usage() {
+    echo "Usage: $0 [--select|-s] [version|path-to-AppImage]"
+    echo ""
+    echo "Examples:"
+    echo "  $0                    # install latest stable"
+    echo "  $0 --select           # interactively choose stable version"
+    echo "  $0 0.0.19             # install stable v0.0.19"
+    echo "  $0 ./T3-Code.AppImage # install from local AppImage"
+}
+
 main() {
-    local arg="${1:-}"
+    local arg=""
+    local select_mode="false"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -s|--select)
+                select_mode="true"
+                ;;
+            -h|--help)
+                usage
+                return 0
+                ;;
+            *)
+                if [[ -z "$arg" ]]; then
+                    arg="$1"
+                else
+                    echo "Error: Unexpected argument: $1"
+                    usage
+                    return 1
+                fi
+                ;;
+        esac
+        shift
+    done
 
     echo "Installing T3 Code (stable)..."
     echo ""
@@ -195,7 +254,12 @@ main() {
     ensure_gh
     ensure_gh_login
 
-    if [[ -n "$arg" ]]; then
+    if [[ "$select_mode" == "true" ]]; then
+        local version
+        version=$(select_stable_version)
+        echo "Installing selected version: $version"
+        download_appimage "$version"
+    elif [[ -n "$arg" ]]; then
         local version="$arg"
         if [[ ! "$version" =~ ^v ]]; then
             version="v$version"
