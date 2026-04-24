@@ -5,6 +5,7 @@ REPO="pingdotgg/t3code"
 APPIMAGE_DIR="$HOME/.local/bin/appimages"
 APP_DIR="$APPIMAGE_DIR/t3code-nightly"
 DESKTOP_ENTRY="$HOME/.local/share/applications/t3code-nightly.desktop"
+DESKTOP_DB="$HOME/.local/share/applications"
 ICON_SOURCE="$HOME/.local/share/icons/t3code.png"
 ICON_URL="https://github.com/pingdotgg/t3code/raw/main/assets/prod/black-universal-1024.png"
 
@@ -122,39 +123,27 @@ download_icon() {
 }
 
 extract_and_integrate() {
-    local appimage_path="$APP_DIR/t3code-nightly.AppImage"
+    mkdir -p "$HOME/.local/share/icons"
+    download_icon "$ICON_SOURCE"
 
-    echo "Extracting AppImage metadata..."
-    cd "$APP_DIR"
-    ./t3code-nightly.AppImage --appimage-extract
-
-    local squash_dir="$APP_DIR/squashfs-root"
-
-    local desktop_file=""
-    for f in "$squash_dir"/*.desktop; do
-        if [[ -f "$f" ]]; then
-            desktop_file="$f"
-            break
-        fi
-    done
-
-    if [[ -n "$desktop_file" ]]; then
-        echo "Installing desktop entry..."
-        cp "$desktop_file" "$DESKTOP_ENTRY"
-
-        sed -i "s|Exec=.*|Exec=$APP_DIR/t3code-nightly.AppImage --ozone-platform=x11|g" "$DESKTOP_ENTRY"
-
-        mkdir -p "$HOME/.local/share/icons"
-        download_icon "$ICON_SOURCE"
-
-        sed -i "s|Icon=.*|Icon=$ICON_SOURCE|g" "$DESKTOP_ENTRY"
-    fi
+    echo "Creating desktop entry..."
+    mkdir -p "$DESKTOP_DB"
+    cat > "$DESKTOP_ENTRY" <<EOF
+[Desktop Entry]
+Type=Application
+Name=T3 Code (Nightly)
+Comment=AI-powered code editor
+Exec=$APP_DIR/t3code-nightly.AppImage --ozone-platform=x11 %F
+Icon=$ICON_SOURCE
+Terminal=false
+StartupNotify=true
+StartupWMClass=t3 code (alpha)
+Categories=Development;IDE;TextEditor;
+MimeType=text/plain;text/x-chdr;text/x-csrc;text/x-cxxsrc;text/x-java;text/x-python;text/x-script;
+EOF
 
     echo "Refreshing desktop database..."
     update-desktop-database "$HOME/.local/share/applications/" 2>/dev/null || true
-
-    echo "Cleaning up squashfs-root..."
-    rm -rf "$squash_dir"
 
     echo ""
     echo "Done! T3 Code (nightly) installed."
