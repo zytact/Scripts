@@ -163,7 +163,7 @@ Exec=$APP_DIR/t3code-nightly.AppImage --ozone-platform=x11 %F
 Icon=$ICON_SOURCE
 Terminal=false
 StartupNotify=true
-StartupWMClass=t3 code (alpha)
+StartupWMClass=t3 code (nightly)
 Categories=Development;IDE;TextEditor;
 MimeType=text/plain;text/x-chdr;text/x-csrc;text/x-cxxsrc;text/x-java;text/x-python;text/x-script;
 EOF
