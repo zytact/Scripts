@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+
+set -e
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+echo -e "${CYAN}Zen Browser Installer${NC}"
+echo "Select version to install:"
+echo "  1) Stable"
+echo "  2) Twilight (nightly)"
+echo -n "Choice [1/2]: "
+read -r choice
+
+case "$choice" in
+    1)
+        RELEASE_TAG="latest"
+        INSTALL_DIR="/opt/zen-browser"
+        DESKTOP_FILE="/usr/share/applications/zen-browser.desktop"
+        APP_NAME="Zen Browser"
+        WM_CLASS="zen"
+        ;;
+    2)
+        RELEASE_TAG="twilight-1"
+        INSTALL_DIR="/opt/zen-browser-twilight"
+        DESKTOP_FILE="/usr/share/applications/zen-browser-twilight.desktop"
+        APP_NAME="Zen Browser (Twilight)"
+        WM_CLASS="zen-twilight"
+        ;;
+    *)
+        echo -e "${RED}Invalid choice. Exiting.${NC}"
+        exit 1
+        ;;
+esac
+
+echo -e "${YELLOW}Fetching release info for ${RELEASE_TAG}...${NC}"
+RELEASE_JSON=$(gh release view --repo zen-browser/desktop "$RELEASE_TAG" --json assets,body)
+DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | test("zen\\.linux-x86_64\\.tar\\.xz")) | .url')
+
+CHANGELOG=$(echo "$RELEASE_JSON" | jq -r '.body')
+if [[ -n "$CHANGELOG" && "$CHANGELOG" != "null" ]]; then
+    echo ""
+    echo "=== Release Notes: ${RELEASE_TAG} ==="
+    echo "$CHANGELOG"
+    echo "=================================="
+else
+    echo -e "${YELLOW}(No release notes available for ${RELEASE_TAG})${NC}"
+fi
+echo ""
+
+read -r -p "Proceed with installation? [y/N] " confirm
+case "$confirm" in
+    y|Y|yes|YES) ;;
+    *) echo "Installation cancelled."; exit 0 ;;
+esac
+
+if [ -z "$DOWNLOAD_URL" ]; then
+    echo -e "${RED}Failed to find download URL for zen.linux-x86_64.tar.xz${NC}"
+    exit 1
+fi
+
+TEMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TEMP_DIR"' EXIT
+
+echo -e "${YELLOW}Downloading from: $DOWNLOAD_URL${NC}"
+curl -L -o "$TEMP_DIR/zen.tar.xz" "$DOWNLOAD_URL"
+
+echo -e "${YELLOW}Extracting archive...${NC}"
+tar -xf "$TEMP_DIR/zen.tar.xz" -C "$TEMP_DIR"
+
+EXTRACTED=$(find "$TEMP_DIR" -maxdepth 1 -mindepth 1 -type d | head -n 1)
+if [ -z "$EXTRACTED" ]; then
+    echo -e "${RED}No directory found after extraction${NC}"
+    exit 1
+fi
+
+if [ -d "$INSTALL_DIR" ]; then
+    echo -e "${YELLOW}Removing existing installation at $INSTALL_DIR...${NC}"
+    sudo rm -rf "$INSTALL_DIR"
+fi
+
+echo -e "${YELLOW}Installing to $INSTALL_DIR...${NC}"
+sudo mv "$EXTRACTED" "$INSTALL_DIR"
+
+echo -e "${YELLOW}Creating desktop entry...${NC}"
+sudo tee "$DESKTOP_FILE" > /dev/null <<EOF
+[Desktop Entry]
+Name=${APP_NAME}
+Exec=${INSTALL_DIR}/zen %U
+Type=Application
+Icon=${INSTALL_DIR}/browser/chrome/icons/default/default128.png
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=application/pdf;application/rdf+xml;application/rss+xml;application/xhtml+xml;application/xhtml_xml;application/xml;image/gif;image/jpeg;image/png;image/webp;text/html;text/xml;x-scheme-handler/http;x-scheme-handler/https;
+Actions=new-window;new-private-window;
+StartupWMClass=${WM_CLASS}
+EOF
+
+sudo update-desktop-database /usr/share/applications/
+
+echo -e "${GREEN}Done! ${APP_NAME} installed to ${INSTALL_DIR}${NC}"
