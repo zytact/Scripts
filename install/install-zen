@@ -37,8 +37,21 @@ case "$choice" in
 esac
 
 echo -e "${YELLOW}Fetching release info for ${RELEASE_TAG}...${NC}"
-RELEASE_JSON=$(gh release view --repo zen-browser/desktop "$RELEASE_TAG" --json assets,body)
+RELEASE_JSON=$(gh release view --repo zen-browser/desktop "$RELEASE_TAG" --json assets,body,tagName)
+LATEST_VERSION=$(echo "$RELEASE_JSON" | jq -r '.tagName')
 DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | test("zen\\.linux-x86_64\\.tar\\.xz")) | .url')
+
+VERSION_FILE="$INSTALL_DIR/.installed_version"
+if [ -f "$VERSION_FILE" ]; then
+    INSTALLED_VERSION=$(cat "$VERSION_FILE")
+    if [ "$INSTALLED_VERSION" = "$LATEST_VERSION" ]; then
+        echo -e "${GREEN}${APP_NAME} is already up to date (${LATEST_VERSION}).${NC}"
+        exit 0
+    fi
+    echo -e "${YELLOW}Installed: ${INSTALLED_VERSION} → Latest: ${LATEST_VERSION}${NC}"
+else
+    echo -e "${YELLOW}Latest version: ${LATEST_VERSION}${NC}"
+fi
 
 CHANGELOG=$(echo "$RELEASE_JSON" | jq -r '.body')
 if [[ -n "$CHANGELOG" && "$CHANGELOG" != "null" ]]; then
@@ -101,4 +114,6 @@ EOF
 
 sudo update-desktop-database /usr/share/applications/
 
-echo -e "${GREEN}Done! ${APP_NAME} installed to ${INSTALL_DIR}${NC}"
+echo "$LATEST_VERSION" | sudo tee "$VERSION_FILE" > /dev/null
+
+echo -e "${GREEN}Done! ${APP_NAME} ${LATEST_VERSION} installed to ${INSTALL_DIR}${NC}"
