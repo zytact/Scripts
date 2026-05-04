@@ -17,7 +17,7 @@ read -r choice
 
 case "$choice" in
     1)
-        RELEASE_TAG="latest"
+        RELEASE_TAG=""
         INSTALL_DIR="/opt/zen-browser"
         DESKTOP_FILE="/usr/share/applications/zen-browser.desktop"
         APP_NAME="Zen Browser"
@@ -29,6 +29,7 @@ case "$choice" in
         DESKTOP_FILE="/usr/share/applications/zen-browser-twilight.desktop"
         APP_NAME="Zen Browser (Twilight)"
         WM_CLASS="zen-twilight"
+        VERSION_FILE=""
         ;;
     *)
         echo -e "${RED}Invalid choice. Exiting.${NC}"
@@ -36,13 +37,13 @@ case "$choice" in
         ;;
 esac
 
-echo -e "${YELLOW}Fetching release info for ${RELEASE_TAG}...${NC}"
-RELEASE_JSON=$(gh release view --repo zen-browser/desktop "$RELEASE_TAG" --json assets,body,tagName)
+echo -e "${YELLOW}Fetching release info for ${RELEASE_TAG:-latest}...${NC}"
+RELEASE_JSON=$(gh release view --repo zen-browser/desktop ${RELEASE_TAG:+"$RELEASE_TAG"} --json assets,body,tagName)
 LATEST_VERSION=$(echo "$RELEASE_JSON" | jq -r '.tagName')
 DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | test("zen\\.linux-x86_64\\.tar\\.xz")) | .url')
 
-VERSION_FILE="$INSTALL_DIR/.installed_version"
-if [ -f "$VERSION_FILE" ]; then
+VERSION_FILE="${VERSION_FILE-$INSTALL_DIR/.installed_version}"
+if [ -n "$VERSION_FILE" ] && [ -f "$VERSION_FILE" ]; then
     INSTALLED_VERSION=$(cat "$VERSION_FILE")
     if [ "$INSTALLED_VERSION" = "$LATEST_VERSION" ]; then
         echo -e "${GREEN}${APP_NAME} is already up to date (${LATEST_VERSION}).${NC}"
@@ -114,6 +115,6 @@ EOF
 
 sudo update-desktop-database /usr/share/applications/
 
-echo "$LATEST_VERSION" | sudo tee "$VERSION_FILE" > /dev/null
+[ -n "$VERSION_FILE" ] && echo "$LATEST_VERSION" | sudo tee "$VERSION_FILE" > /dev/null
 
 echo -e "${GREEN}Done! ${APP_NAME} ${LATEST_VERSION} installed to ${INSTALL_DIR}${NC}"
