@@ -1,17 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APPIMAGE_DIR="$HOME/.local/bin/appimages"
-APP_DIR="$APPIMAGE_DIR/t3code"
-DESKTOP_ENTRY="$HOME/.local/share/applications/t3code.desktop"
-ICON_SOURCE="$HOME/.local/share/icons/t3code.png"
+echo "Select version to uninstall:"
+echo "  1) Stable"
+echo "  2) Nightly"
+echo -n "Choice [1/2]: "
+read -r choice
 
-echo "Uninstalling T3 Code (stable)..."
+APPIMAGE_DIR="$HOME/.local/bin/appimages"
+ICON_SOURCE="$HOME/.local/share/icons/t3code.png"
+STABLE_DESKTOP="$HOME/.local/share/applications/t3code.desktop"
+NIGHTLY_DESKTOP="$HOME/.local/share/applications/t3code-nightly.desktop"
+
+case "$choice" in
+    1)
+        VARIANT="stable"
+        APP_DIR="$APPIMAGE_DIR/t3code"
+        DESKTOP_ENTRY="$STABLE_DESKTOP"
+        ;;
+    2)
+        VARIANT="nightly"
+        APP_DIR="$APPIMAGE_DIR/t3code-nightly"
+        DESKTOP_ENTRY="$NIGHTLY_DESKTOP"
+        ;;
+    *)
+        echo "Invalid choice. Exiting."
+        exit 1
+        ;;
+esac
+
+echo "Uninstalling T3 Code ($VARIANT)..."
 
 rm -rf "$APP_DIR"
 rm -f "$DESKTOP_ENTRY"
-rm -f "$ICON_SOURCE"
+
+if [[ ! -f "$STABLE_DESKTOP" && ! -f "$NIGHTLY_DESKTOP" ]]; then
+    rm -f "$ICON_SOURCE"
+    echo "Removed shared icon (no variants remain)."
+fi
 
 update-desktop-database "$HOME/.local/share/applications/" 2>/dev/null || true
 
-echo "Done! T3 Code (stable) uninstalled."
+echo "Done! T3 Code ($VARIANT) uninstalled."

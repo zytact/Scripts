@@ -112,6 +112,19 @@ ensure_gh_login() {
     gh auth login
 }
 
+get_installed_version() {
+    local version_file="$APP_DIR/.version"
+    if [[ -f "$version_file" ]]; then
+        cat "$version_file"
+    fi
+}
+
+save_installed_version() {
+    local version="$1"
+    mkdir -p "$APP_DIR"
+    echo "$version" > "$APP_DIR/.version"
+}
+
 get_latest_version() {
     gh api repos/$REPO/releases | jq -r ".[] | select(.prerelease == $PRERELEASE) | .tag_name" | head -1
 }
@@ -209,6 +222,8 @@ download_icon() {
 }
 
 extract_and_integrate() {
+    local version="$1"
+
     mkdir -p "$HOME/.local/share/icons"
     download_icon "$ICON_SOURCE"
 
@@ -230,6 +245,10 @@ EOF
 
     echo "Refreshing desktop database..."
     update-desktop-database "$HOME/.local/share/applications/" 2>/dev/null || true
+
+    if [[ -n "$version" ]]; then
+        save_installed_version "$version"
+    fi
 
     echo ""
     echo "Done! T3 Code ($VARIANT) installed."
@@ -254,7 +273,7 @@ install_from_appimage() {
     rm -f "$APP_DIR/$APPIMAGE_NAME"
     cp "$appimage_path" "$APP_DIR/$APPIMAGE_NAME"
 
-    extract_and_integrate
+    extract_and_integrate ""
 }
 
 usage() {
@@ -326,10 +345,19 @@ main() {
         exit 1
     fi
 
+    if [[ "$select_mode" != "true" && -z "$arg" ]]; then
+        local installed_version
+        installed_version=$(get_installed_version)
+        if [[ -n "$installed_version" && "$installed_version" == "$version" ]]; then
+            echo "T3 Code ($VARIANT) is already up to date ($version). Nothing to do."
+            exit 0
+        fi
+    fi
+
     show_changelog "$version"
     confirm_install
     download_appimage "$version"
-    extract_and_integrate
+    extract_and_integrate "$version"
 }
 
 main "$@"
