@@ -1,14 +1,33 @@
 #!/usr/bin/env bash
 
-sudo dnf upgrade -y
-flatpak update -y
-sudo snap refresh
-npm -g update
-npm install -g pnpm@latest-10
-pnpm -g update
-bun upgrade
-bun -g update
-rustup update
-cargo update
-uv self update
-opencode upgrade
+STEPS=("dnf" "flatpak" "snap" "npm" "pnpm" "bun" "rustup" "cargo" "uv" "opencode")
+
+run_step() {
+  case "$1" in
+    dnf)      sudo dnf upgrade -y ;;
+    flatpak)  flatpak update -y ;;
+    snap)     sudo snap refresh ;;
+    npm)      npm -g update ;;
+    pnpm)     npm install -g pnpm@latest-10 && pnpm -g update ;;
+    bun)      bun upgrade && bun -g update ;;
+    rustup)   rustup update ;;
+    cargo)    cargo update ;;
+    uv)       uv self update ;;
+    opencode) opencode upgrade ;;
+  esac
+}
+
+if command -v gum &>/dev/null; then
+  selected=$(printf '%s\n' "${STEPS[@]}" | gum choose --no-limit --selected="$(IFS=,; echo "${STEPS[*]}")")
+else
+  echo "[warning] gum not found, running all steps"
+  selected=$(printf '%s\n' "${STEPS[@]}")
+fi
+
+for step in "${STEPS[@]}"; do
+  if printf '%s\n' "$selected" | grep -qx "$step"; then
+    run_step "$step"
+  else
+    echo "[skipped] $step"
+  fi
+done
