@@ -195,13 +195,12 @@ download_appimage() {
     echo "Downloading T3 Code ${version}..."
     curl -L --progress-bar -o "/tmp/T3-Code-${version_num}-x86_64.AppImage" "$appimage_url"
 
-    echo "Making executable..."
-    chmod +x "/tmp/T3-Code-${version_num}-x86_64.AppImage"
+    gum spin --spinner dot --title "Setting permissions..." -- chmod +x "/tmp/T3-Code-${version_num}-x86_64.AppImage"
 
     echo "Moving to $APP_DIR..."
     mkdir -p "$APP_DIR"
     rm -f "$APP_DIR/$APPIMAGE_NAME"
-    mv "/tmp/T3-Code-${version_num}-x86_64.AppImage" "$APP_DIR/$APPIMAGE_NAME"
+    gum spin --spinner dot --title "Installing AppImage to $APP_DIR..." -- mv "/tmp/T3-Code-${version_num}-x86_64.AppImage" "$APP_DIR/$APPIMAGE_NAME"
 }
 
 download_icon() {
@@ -243,8 +242,7 @@ Categories=Development;IDE;TextEditor;
 MimeType=text/plain;text/x-chdr;text/x-csrc;text/x-cxxsrc;text/x-java;text/x-python;text/x-script;
 EOF
 
-    echo "Refreshing desktop database..."
-    update-desktop-database "$HOME/.local/share/applications/" 2>/dev/null || true
+    gum spin --spinner dot --title "Refreshing desktop database..." -- bash -c 'update-desktop-database "$HOME/.local/share/applications/" 2>/dev/null || true'
 
     if [[ -n "$version" ]]; then
         save_installed_version "$version"
@@ -265,35 +263,44 @@ install_from_appimage() {
         exit 1
     fi
 
-    echo "Making executable..."
-    chmod +x "$appimage_path"
+    gum spin --spinner dot --title "Setting permissions..." -- chmod +x "$appimage_path"
 
     echo "Copying to $APP_DIR..."
     mkdir -p "$APP_DIR"
     rm -f "$APP_DIR/$APPIMAGE_NAME"
-    cp "$appimage_path" "$APP_DIR/$APPIMAGE_NAME"
+    gum spin --spinner dot --title "Copying to $APP_DIR..." -- cp "$appimage_path" "$APP_DIR/$APPIMAGE_NAME"
 
     extract_and_integrate ""
 }
 
 usage() {
-    echo "Usage: $0 [--select|-s] [version|path-to-AppImage]"
+    echo "Usage: $0 [--select|-s] [-f|--force] [version|path-to-AppImage]"
     echo ""
     echo "Examples:"
     echo "  $0                    # install latest"
     echo "  $0 --select           # interactively choose version"
     echo "  $0 0.0.19             # install specific version (stable only)"
     echo "  $0 ./T3-Code.AppImage # install from local AppImage (stable only)"
+    echo "  $0 -f / --force       # reinstall even if already up to date"
+    echo "  $0 -n / --dry-run     # simulate install UI without writing anything"
 }
 
 main() {
     local arg=""
     local select_mode="false"
+    local FORCE="false"
+    local DRY_RUN="false"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -s|--select)
                 select_mode="true"
+                ;;
+            -f|--force)
+                FORCE="true"
+                ;;
+            -n|--dry-run)
+                DRY_RUN="true"
                 ;;
             -h|--help)
                 usage
@@ -349,13 +356,29 @@ main() {
         local installed_version
         installed_version=$(get_installed_version)
         if [[ -n "$installed_version" && "$installed_version" == "$version" ]]; then
-            echo "T3 Code ($VARIANT) is already up to date ($version). Nothing to do."
-            exit 0
+            if [[ "$FORCE" == "true" ]]; then
+                echo "T3 Code ($VARIANT) ${version} already installed — forcing reinstall."
+            else
+                echo "T3 Code ($VARIANT) is already up to date ($version). Nothing to do."
+                exit 0
+            fi
         fi
     fi
 
     show_changelog "$version"
     confirm_install
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "[dry run] Simulating installation..."
+        gum spin --spinner dot --title "[dry run] Downloading T3 Code ${version}..." -- sleep 2
+        gum spin --spinner dot --title "[dry run] Setting permissions..." -- sleep 1
+        gum spin --spinner dot --title "[dry run] Installing AppImage to $APP_DIR..." -- sleep 1
+        echo "[dry run] Would write desktop entry to $DESKTOP_ENTRY"
+        gum spin --spinner dot --title "[dry run] Refreshing desktop database..." -- sleep 1
+        echo "[dry run] Done! Would have installed T3 Code ($VARIANT) ${version}."
+        return 0
+    fi
+
     download_appimage "$version"
     extract_and_integrate "$version"
 }
