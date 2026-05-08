@@ -2,53 +2,40 @@
 
 set -e
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
 DRY_RUN=false
 FORCE=false
 for arg in "$@"; do
     case "$arg" in
         -f|--force)   FORCE=true ;;
         -n|--dry-run) DRY_RUN=true ;;
-        *) echo -e "${RED}Unknown option: $arg${NC}"; exit 1 ;;
+        *) gum log --level error "Unknown option: $arg"; exit 1 ;;
     esac
 done
 
-echo -e "${CYAN}Helium Browser Installer${NC}"
-echo "Select version to install:"
-echo "  1) Stable"
-echo "  2) Pre-release"
-echo -n "Choice [1/2]: "
-read -r choice
+gum style --bold --foreground 212 "Helium Browser Installer"
+
+choice=$(gum choose --header "Select version to install:" "Stable" "Pre-release") || exit 1
 
 case "$choice" in
-    1)
+    Stable)
         RELEASE_TAG=""
         INSTALL_DIR="/opt/helium"
         DESKTOP_FILE="$HOME/.local/share/applications/helium.desktop"
         APP_NAME="Helium Browser"
         ;;
-    2)
+    Pre-release)
         RELEASE_TAG="$(gh release list --repo imputnet/helium-linux --limit 10 | awk '/Pre-release/ {print $1; exit}')"
         if [ -z "$RELEASE_TAG" ]; then
-            echo -e "${RED}No pre-release found.${NC}"
+            gum log --level error "No pre-release found."
             exit 1
         fi
         INSTALL_DIR="/opt/helium-prerelease"
         DESKTOP_FILE="$HOME/.local/share/applications/helium-prerelease.desktop"
         APP_NAME="Helium Browser (Pre-release)"
         ;;
-    *)
-        echo -e "${RED}Invalid choice. Exiting.${NC}"
-        exit 1
-        ;;
 esac
 
-echo -e "${YELLOW}Fetching release info for ${RELEASE_TAG:-latest}...${NC}"
+gum log --level info "Fetching release info for ${RELEASE_TAG:-latest}..."
 RELEASE_JSON=$(gh release view --repo imputnet/helium-linux ${RELEASE_TAG:+"$RELEASE_TAG"} --json assets,body,tagName)
 RELEASE_TAG=$(echo "$RELEASE_JSON" | jq -r '.tagName')
 DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | test("x86_64_linux\\.tar\\.xz$")) | .url')
@@ -58,74 +45,68 @@ if [ -f "$VERSION_FILE" ]; then
     INSTALLED_VERSION=$(cat "$VERSION_FILE")
     if [ "$INSTALLED_VERSION" = "$RELEASE_TAG" ]; then
         if [ "$FORCE" = true ]; then
-            echo -e "${YELLOW}${APP_NAME} ${RELEASE_TAG} already installed — forcing reinstall.${NC}"
+            gum log --level warn "${APP_NAME} ${RELEASE_TAG} already installed — forcing reinstall."
         else
-            echo -e "${GREEN}${APP_NAME} is already up to date (${RELEASE_TAG}).${NC}"
+            gum log --level info "${APP_NAME} is already up to date (${RELEASE_TAG})."
             exit 0
         fi
     else
-        echo -e "${YELLOW}Installed: ${INSTALLED_VERSION} → Latest: ${RELEASE_TAG}${NC}"
+        gum log --level warn "Installed: ${INSTALLED_VERSION} → Latest: ${RELEASE_TAG}"
     fi
 else
-    echo -e "${YELLOW}Latest version: ${RELEASE_TAG}${NC}"
+    gum log --level info "Latest version: ${RELEASE_TAG}"
 fi
 
 CHANGELOG=$(echo "$RELEASE_JSON" | jq -r '.body')
 if [[ -n "$CHANGELOG" && "$CHANGELOG" != "null" ]]; then
     echo ""
-    echo "=== Release Notes: ${RELEASE_TAG} ==="
-    echo "$CHANGELOG"
-    echo "=================================="
+    printf '%s\n' "$CHANGELOG" | gum format --type markdown | gum pager
 else
-    echo -e "${YELLOW}(No release notes available for ${RELEASE_TAG})${NC}"
+    gum log --level warn "No release notes available for ${RELEASE_TAG}."
 fi
 echo ""
 
-read -r -p "Proceed with installation? [y/N] " confirm
-case "$confirm" in
-    y|Y|yes|YES) ;;
-    *) echo "Installation cancelled."; exit 0 ;;
-esac
+gum confirm "Proceed with installation?" || { echo "Installation cancelled."; exit 0; }
 
 if [ "$DRY_RUN" = true ]; then
-    echo -e "${CYAN}[dry run] Simulating installation...${NC}"
-    gum spin --spinner dot --title "[dry run] Downloading x86_64_linux.tar.xz..." -- sleep 2
-    gum spin --spinner dot --title "[dry run] Extracting archive..." -- sleep 1
-    gum spin --spinner dot --title "[dry run] Installing to $INSTALL_DIR..." -- sleep 1
-    echo -e "${YELLOW}[dry run] Would write desktop entry to $DESKTOP_FILE${NC}"
-    gum spin --spinner dot --title "[dry run] Updating desktop database..." -- sleep 1
-    echo -e "${GREEN}[dry run] Done! Would have installed ${APP_NAME} ${RELEASE_TAG} to ${INSTALL_DIR}${NC}"
+    gum log --level info "[dry run] Simulating installation..."
+    gum spin --spinner globe  --title "[dry run] Downloading x86_64_linux.tar.xz..."  -- sleep 2
+    gum spin --spinner jump   --title "[dry run] Extracting archive..."                -- sleep 1
+    gum spin --spinner points --title "[dry run] Installing to $INSTALL_DIR..."        -- sleep 1
+    gum log --level warn "[dry run] Would write desktop entry to $DESKTOP_FILE"
+    gum spin --spinner pulse  --title "[dry run] Updating desktop database..."         -- sleep 1
+    gum log --level info "[dry run] Done! Would have installed ${APP_NAME} ${RELEASE_TAG} to ${INSTALL_DIR}"
     exit 0
 fi
 
 if [ -z "$DOWNLOAD_URL" ]; then
-    echo -e "${RED}Failed to find download URL for x86_64_linux.tar.xz${NC}"
+    gum log --level error "Failed to find download URL for x86_64_linux.tar.xz"
     exit 1
 fi
 
 TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
-echo -e "${YELLOW}Downloading from: $DOWNLOAD_URL${NC}"
+gum log --level info "Downloading from: $DOWNLOAD_URL"
 curl -L -o "$TEMP_DIR/helium.tar.xz" "$DOWNLOAD_URL"
 
-gum spin --spinner dot --title "Extracting archive..." -- tar -xf "$TEMP_DIR/helium.tar.xz" -C "$TEMP_DIR"
+gum spin --spinner jump   --title "Extracting archive..."                           -- tar -xf "$TEMP_DIR/helium.tar.xz" -C "$TEMP_DIR"
 
 EXTRACTED=$(find "$TEMP_DIR" -maxdepth 1 -mindepth 1 -type d | head -n 1)
 if [ -z "$EXTRACTED" ]; then
-    echo -e "${RED}No directory found after extraction${NC}"
+    gum log --level error "No directory found after extraction"
     exit 1
 fi
 
 if [ -d "$INSTALL_DIR" ]; then
-    gum spin --spinner dot --title "Removing existing installation at $INSTALL_DIR..." -- sudo rm -rf "$INSTALL_DIR"
+    gum spin --spinner dot    --title "Removing existing installation at $INSTALL_DIR..." -- sudo rm -rf "$INSTALL_DIR"
 fi
 
-gum spin --spinner dot --title "Installing to $INSTALL_DIR..." -- sudo mv "$EXTRACTED" "$INSTALL_DIR"
+gum spin --spinner points --title "Installing to $INSTALL_DIR..."                   -- sudo mv "$EXTRACTED" "$INSTALL_DIR"
 
 mkdir -p "$(dirname "$DESKTOP_FILE")"
 
-echo -e "${YELLOW}Creating desktop entry...${NC}"
+gum log --level info "Creating desktop entry..."
 cat > "$DESKTOP_FILE" <<EOF
 [Desktop Entry]
 Name=${APP_NAME}
@@ -141,9 +122,9 @@ EOF
 chmod +x "$DESKTOP_FILE"
 
 if command -v update-desktop-database &>/dev/null; then
-    gum spin --spinner dot --title "Updating desktop database..." -- update-desktop-database "$(dirname "$DESKTOP_FILE")"
+    gum spin --spinner pulse  --title "Updating desktop database..."                -- update-desktop-database "$(dirname "$DESKTOP_FILE")"
 fi
 
 echo "$RELEASE_TAG" | sudo tee "$INSTALL_DIR/.installed_version" > /dev/null
 
-echo -e "${GREEN}Done! ${APP_NAME} ${RELEASE_TAG} installed to ${INSTALL_DIR}${NC}"
+gum log --level info "Done! ${APP_NAME} ${RELEASE_TAG} installed to ${INSTALL_DIR}"

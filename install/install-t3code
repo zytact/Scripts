@@ -7,14 +7,10 @@ DESKTOP_DB="$HOME/.local/share/applications"
 ICON_SOURCE="$HOME/.local/share/icons/t3code.png"
 ICON_URL="https://github.com/pingdotgg/t3code/raw/main/assets/prod/black-universal-1024.png"
 
-echo "Select version to install:"
-echo "  1) Stable"
-echo "  2) Nightly"
-echo -n "Choice [1/2]: "
-read -r choice
+choice=$(gum choose --header "Select version to install:" "Stable" "Nightly") || exit 1
 
 case "$choice" in
-    1)
+    Stable)
         VARIANT="stable"
         APP_DIR="$APPIMAGE_DIR/t3code"
         DESKTOP_ENTRY="$HOME/.local/share/applications/t3code.desktop"
@@ -23,7 +19,7 @@ case "$choice" in
         STARTUP_WM_CLASS="t3 code (alpha)"
         PRERELEASE="false"
         ;;
-    2)
+    Nightly)
         VARIANT="nightly"
         APP_DIR="$APPIMAGE_DIR/t3code-nightly"
         DESKTOP_ENTRY="$HOME/.local/share/applications/t3code-nightly.desktop"
@@ -31,10 +27,6 @@ case "$choice" in
         DESKTOP_APP_NAME="T3 Code (Nightly)"
         STARTUP_WM_CLASS="t3 code (nightly)"
         PRERELEASE="true"
-        ;;
-    *)
-        echo "Invalid choice. Exiting."
-        exit 1
         ;;
 esac
 
@@ -62,42 +54,34 @@ ensure_gh() {
         return 0
     fi
 
-    echo "GitHub CLI (gh) is required to install T3 Code."
-    read -r -p "Install gh now? [y/N] " answer
+    gum log --level warn "GitHub CLI (gh) is required to install T3 Code."
+    gum confirm "Install gh now?" || { gum log --level error "Skipping install because this script needs gh to fetch T3 Code releases."; exit 1; }
 
-    case "$answer" in
-        y|Y|yes|YES)
-            local distro
-            distro=$(detect_distro)
+    local distro
+    distro=$(detect_distro)
 
-            case "$distro" in
-                debian)
-                    (type -p wget >/dev/null || (sudo apt update && sudo apt install wget -y)) \
-                    && (type -p curl >/dev/null || sudo apt install curl -y) \
-                    && sudo mkdir -p -m 755 /etc/apt/keyrings \
-                    && out=$(mktemp) && wget -nv -O$out https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-                    && cat $out | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
-                    && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
-                    && sudo mkdir -p -m 755 /etc/apt/sources.list.d \
-                    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
-                    && sudo apt update \
-                    && sudo apt install gh -y
-                    ;;
-                fedora)
-                    (type -p wget >/dev/null || sudo dnf install wget -y) \
-                    && (type -p curl >/dev/null || sudo dnf install curl -y) \
-                    && sudo dnf install dnf5-plugins \
-                    && sudo dnf config-manager addrepo --from-repofile=https://cli.github.com/packages/rpm/gh-cli.repo \
-                    && sudo dnf install gh --repo gh-cli
-                    ;;
-                *)
-                    echo "Error: Unsupported distribution. gh installation is supported on Debian/Ubuntu and Fedora/RHEL-based systems."
-                    exit 1
-                    ;;
-            esac
+    case "$distro" in
+        debian)
+            (type -p wget >/dev/null || (sudo apt update && sudo apt install wget -y)) \
+            && (type -p curl >/dev/null || sudo apt install curl -y) \
+            && sudo mkdir -p -m 755 /etc/apt/keyrings \
+            && out=$(mktemp) && wget -nv -O$out https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            && cat $out | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+            && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+            && sudo mkdir -p -m 755 /etc/apt/sources.list.d \
+            && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+            && sudo apt update \
+            && sudo apt install gh -y
+            ;;
+        fedora)
+            (type -p wget >/dev/null || sudo dnf install wget -y) \
+            && (type -p curl >/dev/null || sudo dnf install curl -y) \
+            && sudo dnf install dnf5-plugins \
+            && sudo dnf config-manager addrepo --from-repofile=https://cli.github.com/packages/rpm/gh-cli.repo \
+            && sudo dnf install gh --repo gh-cli
             ;;
         *)
-            echo "Skipping install because this script needs gh to fetch T3 Code releases."
+            gum log --level error "Unsupported distribution. gh installation is supported on Debian/Ubuntu and Fedora/RHEL-based systems."
             exit 1
             ;;
     esac
@@ -108,7 +92,7 @@ ensure_gh_login() {
         return 0
     fi
 
-    echo "Signing in to GitHub CLI..."
+    gum log --level info "Signing in to GitHub CLI..."
     gh auth login
 }
 
@@ -135,48 +119,28 @@ get_versions() {
 
 select_version() {
     local versions=()
-    local selected
-
     mapfile -t versions < <(get_versions)
 
     if [[ ${#versions[@]} -eq 0 ]]; then
-        echo "Error: Could not find any $VARIANT releases." >&2
+        gum log --level error "Could not find any $VARIANT releases."
         return 1
     fi
 
-    echo "Select a $VARIANT version:" >&2
-    PS3="Enter choice number: "
-    select selected in "${versions[@]}"; do
-        if [[ -n "${selected:-}" ]]; then
-            echo "$selected"
-            return 0
-        fi
-        echo "Invalid selection. Try again." >&2
-    done
+    printf '%s\n' "${versions[@]}" | gum filter --placeholder "Search $VARIANT versions..." || return 1
 }
 
 show_changelog() {
     local version="$1"
-    echo "Fetching release notes for ${version}..."
+    gum log --level info "Fetching release notes for ${version}..."
     local body
     body=$(gh api repos/$REPO/releases/tags/$version --jq '.body' 2>/dev/null || true)
     if [[ -n "$body" ]]; then
         echo ""
-        echo "=== Release Notes: ${version} ==="
-        echo "$body"
-        echo "=================================="
+        printf '%s\n' "$body" | gum format --type markdown | gum pager
     else
-        echo "(No release notes available for ${version})"
+        gum log --level warn "No release notes available for ${version}."
     fi
     echo ""
-}
-
-confirm_install() {
-    read -r -p "Proceed with installation? [y/N] " answer
-    case "$answer" in
-        y|Y|yes|YES) return 0 ;;
-        *) echo "Installation cancelled."; exit 0 ;;
-    esac
 }
 
 download_appimage() {
@@ -192,15 +156,13 @@ download_appimage() {
 
     local appimage_url="https://github.com/$REPO/releases/download/${version}/T3-Code-${version_num}-x86_64.AppImage"
 
-    echo "Downloading T3 Code ${version}..."
+    gum log --level info "Downloading T3 Code ${version}..."
     curl -L --progress-bar -o "/tmp/T3-Code-${version_num}-x86_64.AppImage" "$appimage_url"
 
-    gum spin --spinner dot --title "Setting permissions..." -- chmod +x "/tmp/T3-Code-${version_num}-x86_64.AppImage"
-
-    echo "Moving to $APP_DIR..."
+    gum spin --spinner dot    --title "Setting permissions..."          -- chmod +x "/tmp/T3-Code-${version_num}-x86_64.AppImage"
     mkdir -p "$APP_DIR"
     rm -f "$APP_DIR/$APPIMAGE_NAME"
-    gum spin --spinner dot --title "Installing AppImage to $APP_DIR..." -- mv "/tmp/T3-Code-${version_num}-x86_64.AppImage" "$APP_DIR/$APPIMAGE_NAME"
+    gum spin --spinner points --title "Installing AppImage to $APP_DIR..." -- mv "/tmp/T3-Code-${version_num}-x86_64.AppImage" "$APP_DIR/$APPIMAGE_NAME"
 }
 
 download_icon() {
@@ -216,7 +178,7 @@ download_icon() {
         return 0
     fi
 
-    echo "Error: curl or wget is required to download the desktop icon"
+    gum log --level error "curl or wget is required to download the desktop icon"
     return 1
 }
 
@@ -226,7 +188,7 @@ extract_and_integrate() {
     mkdir -p "$HOME/.local/share/icons"
     download_icon "$ICON_SOURCE"
 
-    echo "Creating desktop entry..."
+    gum log --level info "Creating desktop entry..."
     mkdir -p "$DESKTOP_DB"
     cat > "$DESKTOP_ENTRY" <<EOF
 [Desktop Entry]
@@ -242,33 +204,30 @@ Categories=Development;IDE;TextEditor;
 MimeType=text/plain;text/x-chdr;text/x-csrc;text/x-cxxsrc;text/x-java;text/x-python;text/x-script;
 EOF
 
-    gum spin --spinner dot --title "Refreshing desktop database..." -- bash -c 'update-desktop-database "$HOME/.local/share/applications/" 2>/dev/null || true'
+    gum spin --spinner pulse --title "Refreshing desktop database..." -- bash -c 'update-desktop-database "$HOME/.local/share/applications/" 2>/dev/null || true'
 
     if [[ -n "$version" ]]; then
         save_installed_version "$version"
     fi
 
     echo ""
-    echo "Done! T3 Code ($VARIANT) installed."
-    echo "You can now find it in your app launcher."
+    gum log --level info "Done! T3 Code ($VARIANT) installed. You can now find it in your app launcher."
 }
 
 install_from_appimage() {
     local appimage_path="$1"
 
-    echo "Using local AppImage: $appimage_path"
+    gum log --level info "Using local AppImage: $appimage_path"
 
     if [[ ! -f "$appimage_path" ]]; then
-        echo "Error: File not found: $appimage_path"
+        gum log --level error "File not found: $appimage_path"
         exit 1
     fi
 
-    gum spin --spinner dot --title "Setting permissions..." -- chmod +x "$appimage_path"
-
-    echo "Copying to $APP_DIR..."
+    gum spin --spinner dot    --title "Setting permissions..."    -- chmod +x "$appimage_path"
     mkdir -p "$APP_DIR"
     rm -f "$APP_DIR/$APPIMAGE_NAME"
-    gum spin --spinner dot --title "Copying to $APP_DIR..." -- cp "$appimage_path" "$APP_DIR/$APPIMAGE_NAME"
+    gum spin --spinner points --title "Copying to $APP_DIR..."   -- cp "$appimage_path" "$APP_DIR/$APPIMAGE_NAME"
 
     extract_and_integrate ""
 }
@@ -310,7 +269,7 @@ main() {
                 if [[ -z "$arg" ]]; then
                     arg="$1"
                 else
-                    echo "Error: Unexpected argument: $1"
+                    gum log --level error "Unexpected argument: $1"
                     usage
                     return 1
                 fi
@@ -319,7 +278,7 @@ main() {
         shift
     done
 
-    echo "Installing T3 Code ($VARIANT)..."
+    gum log --level info "Installing T3 Code ($VARIANT)..."
     echo ""
 
     if [[ "$VARIANT" == "stable" && -n "$arg" && "${arg%.AppImage}" != "$arg" && -f "$arg" ]]; then
@@ -333,7 +292,7 @@ main() {
     local version
     if [[ "$select_mode" == "true" ]]; then
         version=$(select_version)
-        echo "Installing selected version: $version"
+        gum log --level info "Installing selected version: $version"
     elif [[ -n "$arg" ]]; then
         version="$arg"
         if [[ "$VARIANT" == "stable" && ! "$version" =~ ^v ]]; then
@@ -341,14 +300,14 @@ main() {
         elif [[ "$VARIANT" == "nightly" && ! "$version" =~ ^nightly- ]]; then
             version="nightly-$version"
         fi
-        echo "Installing version: $version"
+        gum log --level info "Installing version: $version"
     else
         version=$(get_latest_version)
-        echo "Latest $VARIANT version: $version"
+        gum log --level info "Latest $VARIANT version: $version"
     fi
 
     if [[ -z "$version" ]]; then
-        echo "Error: Could not find a $VARIANT release."
+        gum log --level error "Could not find a $VARIANT release."
         exit 1
     fi
 
@@ -357,25 +316,25 @@ main() {
         installed_version=$(get_installed_version)
         if [[ -n "$installed_version" && "$installed_version" == "$version" ]]; then
             if [[ "$FORCE" == "true" ]]; then
-                echo "T3 Code ($VARIANT) ${version} already installed — forcing reinstall."
+                gum log --level warn "T3 Code ($VARIANT) ${version} already installed — forcing reinstall."
             else
-                echo "T3 Code ($VARIANT) is already up to date ($version). Nothing to do."
+                gum log --level info "T3 Code ($VARIANT) is already up to date ($version). Nothing to do."
                 exit 0
             fi
         fi
     fi
 
     show_changelog "$version"
-    confirm_install
+    gum confirm "Proceed with installation?" || { echo "Installation cancelled."; exit 0; }
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        echo "[dry run] Simulating installation..."
-        gum spin --spinner dot --title "[dry run] Downloading T3 Code ${version}..." -- sleep 2
-        gum spin --spinner dot --title "[dry run] Setting permissions..." -- sleep 1
-        gum spin --spinner dot --title "[dry run] Installing AppImage to $APP_DIR..." -- sleep 1
-        echo "[dry run] Would write desktop entry to $DESKTOP_ENTRY"
-        gum spin --spinner dot --title "[dry run] Refreshing desktop database..." -- sleep 1
-        echo "[dry run] Done! Would have installed T3 Code ($VARIANT) ${version}."
+        gum log --level info "[dry run] Simulating installation..."
+        gum spin --spinner globe  --title "[dry run] Downloading T3 Code ${version}..."    -- sleep 2
+        gum spin --spinner dot    --title "[dry run] Setting permissions..."                -- sleep 1
+        gum spin --spinner points --title "[dry run] Installing AppImage to $APP_DIR..."   -- sleep 1
+        gum log --level warn "[dry run] Would write desktop entry to $DESKTOP_ENTRY"
+        gum spin --spinner pulse  --title "[dry run] Refreshing desktop database..."       -- sleep 1
+        gum log --level info "[dry run] Done! Would have installed T3 Code ($VARIANT) ${version}."
         return 0
     fi
 
