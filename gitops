@@ -5,7 +5,7 @@
 set -euo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MODEL="${GITOPS_MODEL:-opencode/minimax-m2.5-free}"
+MODEL="${GITOPS_MODEL:-github-copilot/gpt-5.4-mini}"
 MAIN_BRANCHES="main master develop"
 
 AGENT_SYSTEM_PROMPT='You are a git workflow assistant. Generate concise conventional commit messages, short kebab-case branch names, and clear GitHub PR descriptions in markdown. Output only the requested artifact — no commentary, no explanations.'
