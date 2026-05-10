@@ -11,8 +11,8 @@ MAIN_BRANCHES="main master develop"
 AGENT_SYSTEM_PROMPT='You are a git workflow assistant. Generate concise conventional commit messages, short kebab-case branch names, and clear GitHub PR descriptions in markdown. Output only the requested artifact — no commentary, no explanations.'
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-die()  { echo "❌ $*" >&2; exit 1; }
-info() { echo "→ $*"; }
+die()  { gum style --foreground 196 "✗ $*" >&2; exit 1; }
+info() { gum style --foreground 33 "→ $*"; }
 
 require() {
   for cmd in "$@"; do
@@ -26,15 +26,19 @@ run_opencode() {
   local full_msg="${AGENT_SYSTEM_PROMPT}
 
 ${instruction}"
+  local result
   if [[ -n "$context" ]]; then
     local ctx_file
     ctx_file="$(mktemp /tmp/gitops-context.XXXXXX)"
     trap 'rm -f "$ctx_file"' RETURN
     printf '%s' "$context" > "$ctx_file"
-    opencode run --model "$MODEL" "$full_msg" -f "$ctx_file"
+    result="$(gum spin --spinner dot --title "Thinking…" -- \
+      opencode run --model "$MODEL" "$full_msg" -f "$ctx_file")"
   else
-    opencode run --model "$MODEL" "$full_msg"
+    result="$(gum spin --spinner dot --title "Thinking…" -- \
+      opencode run --model "$MODEL" "$full_msg")"
   fi
+  echo "$result"
 }
 
 staged_diff() {
@@ -68,18 +72,10 @@ detect_base_branch() {
   die "Cannot detect base branch. Set GITOPS_BASE explicitly."
 }
 
-confirm() {
-  # $1 = prompt, returns 0 for yes
-  local answer
-  read -rp "$1 [Y/n] " answer
-  [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]]
-}
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 cmd_commit() {
-  require gum
-
   # Collect unstaged + untracked files
   local unstaged untracked all_files
   unstaged="$(git diff --name-only 2>/dev/null)"
@@ -132,11 +128,12 @@ cmd_commit() {
   echo "  📝 $msg"
   echo ""
 
-  if confirm "Commit with this message?"; then
+  if gum confirm "Commit with this message?"; then
     git commit -m "$msg"
     info "Committed: $msg"
   else
-    read -rp "Enter your message (or blank to abort): " custom
+    local custom
+    custom="$(gum input --placeholder "Custom commit message (blank to abort)")"
     [[ -z "$custom" ]] && die "Aborted."
     git commit -m "$custom"
   fi
@@ -159,11 +156,12 @@ cmd_branch() {
   echo "  🌿 $branch"
   echo ""
 
-  if confirm "Checkout new branch '$branch'?"; then
+  if gum confirm "Checkout new branch '$branch'?"; then
     git checkout -b "$branch"
     info "Switched to branch: $branch"
   else
-    read -rp "Enter branch name (or blank to abort): " custom
+    local custom
+    custom="$(gum input --placeholder "Custom branch name (blank to abort)")"
     [[ -z "$custom" ]] && die "Aborted."
     git checkout -b "$custom"
   fi
@@ -198,14 +196,13 @@ $diff"
   title="$(git log "$base_branch".."$current" --oneline | tail -1 | sed 's/^[a-f0-9]* //' || echo "$current")"
 
   echo ""
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "  Title: $title"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "$body"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  gum style \
+    --border rounded --border-foreground 212 \
+    --padding "0 1" \
+    "$(printf 'Title: %s\n\n%s' "$title" "$body")"
   echo ""
 
-  if confirm "Open PR with this description?"; then
+  if gum confirm "Open PR with this description?"; then
     gh pr create \
       --base "$base_branch" \
       --title "$title" \
@@ -244,7 +241,7 @@ cmd_auto() {
 }
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
-require git opencode
+require git opencode gum
 
 case "${1:-help}" in
   commit) cmd_commit ;;
