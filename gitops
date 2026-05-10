@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# gitops — AI-powered git workflow using opencode
+# Usage: gitops <commit|branch|pr|auto>
+
+set -euo pipefail
+
+# ── Config ────────────────────────────────────────────────────────────────────
+MODEL="${GITOPS_MODEL:-opencode/minimax-m2.5-free}"
+MAIN_BRANCHES="main master develop"
+
+AGENT_SYSTEM_PROMPT='You are a git workflow assistant. Generate concise conventional commit messages, short kebab-case branch names, and clear GitHub PR descriptions in markdown. Output only the requested artifact — no commentary, no explanations.'
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+die()  { echo "❌ $*" >&2; exit 1; }
+info() { echo "→ $*"; }
+
+require() {
+  for cmd in "$@"; do
+    command -v "$cmd" &>/dev/null || die "Required command not found: $cmd"
+  done
+}
+
+run_opencode() {
+  # $1 = short instruction (message arg), $2 = large context written to file
+  local instruction="$1" context="${2:-}"
+  local full_msg="${AGENT_SYSTEM_PROMPT}
+
+${instruction}"
+  if [[ -n "$context" ]]; then
+    local ctx_file
+    ctx_file="$(mktemp /tmp/gitops-context.XXXXXX)"
+    trap 'rm -f "$ctx_file"' RETURN
+    printf '%s' "$context" > "$ctx_file"
+    opencode run --model "$MODEL" "$full_msg" -f "$ctx_file"
+  else
+    opencode run --model "$MODEL" "$full_msg"
+  fi
+}
+
+staged_diff() {
+  git diff --cached --stat --diff-filter=ACMRD
+  echo "---"
+  git diff --cached --diff-filter=ACMRD
+}
+
+current_branch() {
+  git rev-parse --abbrev-ref HEAD
+}
+
+is_main_branch() {
+  local branch="$1"
+  for b in $MAIN_BRANCHES; do
+    [[ "$branch" == "$b" ]] && return 0
+  done
+  return 1
+}
+
+confirm() {
+  # $1 = prompt, returns 0 for yes
+  local answer
+  read -rp "$1 [Y/n] " answer
+  [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]]
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+cmd_commit() {
+  require gum
+
+  # Collect unstaged + untracked files
+  local unstaged untracked all_files
+  unstaged="$(git diff --name-only 2>/dev/null)"
+  untracked="$(git ls-files --others --exclude-standard 2>/dev/null)"
+  all_files="$(printf '%s\n%s\n' "$unstaged" "$untracked" | sort -u | grep -v '^$' || true)"
+
+  # If everything is already staged, skip the file selector
+  if [[ -z "$all_files" ]] && [[ -n "$(git diff --cached --name-only 2>/dev/null)" ]]; then
+    info "All changes already staged — skipping file selection."
+  elif [[ -n "$all_files" ]]; then
+    echo ""
+    gum style \
+      --foreground 212 --border-foreground 212 --border rounded \
+      --padding "0 1" "Select files to stage  (↑↓ navigate · x toggle · enter confirm)"
+    echo ""
+
+    local selected
+    selected="$(echo "$all_files" | gum choose --no-limit \
+      --header "" \
+      --cursor "    " \
+      --cursor-prefix "[ ] " \
+      --selected-prefix "[x] " \
+      --unselected-prefix "[ ] " \
+      --height 20)" || die "Staging cancelled."
+
+    if [[ -n "$selected" ]]; then
+      echo "$selected" | while read -r file; do
+        git add -- "$file"
+      done
+      local count
+      count="$(echo "$selected" | grep -c .)"
+      echo ""
+      gum style --foreground 82 "✔ Staged $count file(s):"
+      echo "$selected" | while read -r f; do echo "  + $f"; done
+      echo ""
+    fi
+  fi
+
+  [[ -z "$(git diff --cached --name-only)" ]] && die "No staged changes."
+
+  local diff
+  diff="$(staged_diff)"
+
+  info "Generating commit message…"
+  local msg
+  msg="$(run_opencode "Generate a conventional commit message for the staged diff in the attached file." "$diff")"
+
+  msg="$(echo "$msg" | sed 's/^[[:space:]]*//' | head -1)"
+  echo ""
+  echo "  📝 $msg"
+  echo ""
+
+  if confirm "Commit with this message?"; then
+    git commit -m "$msg"
+    info "Committed: $msg"
+  else
+    read -rp "Enter your message (or blank to abort): " custom
+    [[ -z "$custom" ]] && die "Aborted."
+    git commit -m "$custom"
+  fi
+}
+
+cmd_branch() {
+  local diff
+  diff="$(staged_diff)"
+  [[ -z "$(git diff --cached --name-only 2>/dev/null)" ]] && {
+    # Fall back to unstaged changes for branch naming context
+    diff="$(git diff --stat HEAD 2>/dev/null || echo 'new work')"
+  }
+
+  info "Generating branch name…"
+  local branch
+  branch="$(run_opencode "Generate a branch name for the diff in the attached file. Output ONLY the branch name, nothing else." "$diff")"
+
+  branch="$(echo "$branch" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+  echo ""
+  echo "  🌿 $branch"
+  echo ""
+
+  if confirm "Checkout new branch '$branch'?"; then
+    git checkout -b "$branch"
+    info "Switched to branch: $branch"
+  else
+    read -rp "Enter branch name (or blank to abort): " custom
+    [[ -z "$custom" ]] && die "Aborted."
+    git checkout -b "$custom"
+  fi
+}
+
+cmd_pr() {
+  require gh
+
+  local base_branch current
+  current="$(current_branch)"
+  base_branch="${GITOPS_BASE:-main}"
+
+  # Gather context: commits ahead of base + their diffs
+  local commits diff context
+  commits="$(git log "$base_branch".."$current" --oneline 2>/dev/null || echo '(no commits yet)')"
+  diff="$(git diff "$base_branch"..."$current" --stat 2>/dev/null || staged_diff)"
+
+  context="Branch: $current → $base_branch
+
+Commits:
+$commits
+
+Diff summary:
+$diff"
+
+  info "Generating PR description…"
+  local body
+  body="$(run_opencode "Generate a GitHub PR description for the branch context in the attached file. Output only the markdown body." "$context")"
+
+  # Derive title from first commit or generate fresh
+  local title
+  title="$(git log "$base_branch".."$current" --oneline | tail -1 | sed 's/^[a-f0-9]* //' || echo "$current")"
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  Title: $title"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "$body"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+
+  if confirm "Open PR with this description?"; then
+    gh pr create \
+      --base "$base_branch" \
+      --title "$title" \
+      --body "$body"
+  else
+    info "PR creation skipped. Body saved to /tmp/gitops_pr_body.md"
+    echo "$body" > /tmp/gitops_pr_body.md
+  fi
+}
+
+cmd_auto() {
+  local branch
+  branch="$(current_branch)"
+
+  # Step 1: if on a protected branch, create a feature branch first
+  if is_main_branch "$branch"; then
+    info "On '$branch' — creating a feature branch first"
+    cmd_branch
+  fi
+
+  # Step 2: stage + commit
+  cmd_commit
+
+  # Step 3: push current branch
+  local current
+  current="$(current_branch)"
+  info "Pushing '$current'…"
+  git push -u origin "$current" 2>/dev/null || info "Push failed or already pushed — continuing"
+
+  # Step 4: open PR
+  if command -v gh &>/dev/null; then
+    cmd_pr
+  else
+    info "gh not found — skipping PR creation (install: https://cli.github.com)"
+  fi
+}
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+require git opencode
+
+case "${1:-help}" in
+  commit) cmd_commit ;;
+  branch) cmd_branch ;;
+  pr)     cmd_pr ;;
+  auto)   cmd_auto ;;
+  *)
+    echo "Usage: gitops <command>"
+    echo ""
+    echo "  commit   Pick files to stage, generate commit message, and commit"
+    echo "  branch   Generate and checkout a new branch (feat/fix/chore/…)"
+    echo "  pr       Generate PR description and open with gh cli"
+    echo "  auto     Full flow: branch (if on main) → commit → push → pr"
+    echo ""
+    echo "Env vars:"
+    echo "  GITOPS_MODEL    opencode model string (default: opencode/minimax-m2.5-free)"
+    echo "  GITOPS_BASE     base branch for PRs (default: main)"
+    ;;
+esac
