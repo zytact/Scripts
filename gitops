@@ -11,9 +11,58 @@ MAIN_BRANCHES="main master develop"
 
 AGENT_SYSTEM_PROMPT='You are a git workflow assistant. Generate concise conventional commit messages, short kebab-case branch names, and clear GitHub PR descriptions in markdown. Output only the requested artifact — no commentary, no explanations.'
 
+# ── Theme ─────────────────────────────────────────────────────────────────────
+_osc11_is_light() {
+  # Query terminal background via OSC 11; returns 0 if light, 1 otherwise.
+  [[ -t 0 && -t 1 ]] || return 1
+  local response
+  # Save terminal state, switch to raw mode, send query, read reply, restore
+  local old_stty
+  old_stty="$(stty -g 2>/dev/null)" || return 1
+  stty raw -echo min 0 time 2 2>/dev/null || return 1
+  printf '\033]11;?\033\\' >/dev/tty
+  IFS= read -r -s -d $'\a' response </dev/tty 2>/dev/null
+  stty "$old_stty" 2>/dev/null
+  [[ -z "$response" ]] && return 1
+  # Response: ESC ] 11 ; rgb:RRRR/GGGG/BBBB — extract first two hex digits of R
+  local r
+  r="$(printf '%s' "$response" | grep -oP '(?<=rgb:)[0-9a-fA-F]{2}' | head -1)" || return 1
+  [[ -z "$r" ]] && return 1
+  (( 16#$r >= 128 )) && return 0 || return 1
+}
+
+detect_theme() {
+  [[ "${GITOPS_THEME:-}" == "light" ]] && echo light && return
+  [[ "${GITOPS_THEME:-}" == "dark"  ]] && echo dark  && return
+
+  # 1. COLORFGBG (exported by kitty, alacritty, xterm, etc.)
+  local bg="${COLORFGBG:-}"
+  if [[ -n "$bg" ]]; then
+    bg="${bg##*;}"
+    [[ "$bg" == "15" || "$bg" == "7" ]] && echo light || echo dark
+    return
+  fi
+
+  # 2. OSC 11 terminal query
+  if _osc11_is_light; then
+    echo light; return
+  fi
+
+  # 3. Default
+  echo dark
+}
+_THEME="$(detect_theme)"
+if [[ "$_THEME" == "light" ]]; then
+  C_INFO="#0055CC"; C_SUCCESS="#1A7A1A"; C_ERROR="#CC0000"
+  C_ACCENT="#8B008B"; C_BORDER="#8B008B"
+else
+  C_INFO="#5FAFFF"; C_SUCCESS="#5FD75F"; C_ERROR="#FF5F5F"
+  C_ACCENT="#FF87D7"; C_BORDER="#FF87D7"
+fi
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
-die()  { gum style --foreground 196 "✗ $*" >&2; exit 1; }
-info() { gum style --foreground 33 "→ $*"; }
+die()  { gum style --foreground "$C_ERROR" "✗ $*" >&2; exit 1; }
+info() { gum style --foreground "$C_INFO" "→ $*"; }
 
 require() {
   for cmd in "$@"; do
@@ -94,7 +143,7 @@ cmd_commit() {
   elif [[ -n "$all_files" ]]; then
     echo ""
     gum style \
-      --foreground 212 --border-foreground 212 --border rounded \
+      --foreground "$C_ACCENT" --border-foreground "$C_BORDER" --border rounded \
       --padding "0 1" "Select files to stage  (↑↓ navigate · x toggle · enter confirm)"
     echo ""
 
@@ -114,7 +163,7 @@ cmd_commit() {
       local count
       count="$(echo "$selected" | grep -c .)"
       echo ""
-      gum style --foreground 82 "✔ Staged $count file(s):"
+      gum style --foreground "$C_SUCCESS" "✔ Staged $count file(s):"
       echo "$selected" | while read -r f; do echo "  + $f"; done
       echo ""
     fi
@@ -213,7 +262,7 @@ $diff"
 
   echo ""
   gum style \
-    --border rounded --border-foreground 212 \
+    --border rounded --border-foreground "$C_BORDER" \
     --padding "0 1" \
     "$(printf 'Title: %s\n\n%s' "$title" "$body")"
   echo ""
@@ -285,5 +334,6 @@ case "${1:-help}" in
     echo "  GITOPS_MODEL    opencode model string (default: github-copilot/gpt-5.4-mini)"
     echo "  GITOPS_VARIANT  reasoning effort variant (default: low; set empty to omit)"
     echo "  GITOPS_BASE     base branch for PRs (default: main)"
+    echo "  GITOPS_THEME    force color theme: light|dark (default: auto via \$COLORFGBG)"
     ;;
 esac
