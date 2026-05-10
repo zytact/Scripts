@@ -73,6 +73,11 @@ detect_base_branch() {
 }
 
 
+edit_in_editor() {
+  # $1 = file path — caller manages the temp file; editor runs outside any $()
+  "${EDITOR:-nano}" "$1" </dev/tty >/dev/tty
+}
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 cmd_commit() {
@@ -128,15 +133,25 @@ cmd_commit() {
   echo "  📝 $msg"
   echo ""
 
-  if gum confirm "Commit with this message?"; then
-    git commit -m "$msg"
-    info "Committed: $msg"
-  else
-    local custom
-    custom="$(gum input --placeholder "Custom commit message (blank to abort)")"
-    [[ -z "$custom" ]] && die "Aborted."
-    git commit -m "$custom"
-  fi
+  local action
+  action="$(printf 'Accept\nEdit\nAbort' | gum choose --header "Commit message:")"
+  case "$action" in
+    Accept)
+      git commit -m "$msg"
+      info "Committed: $msg" ;;
+    Edit)
+      local tmp_msg
+      tmp_msg="$(mktemp /tmp/gitops-commit.XXXXXX)"
+      printf '%s' "$msg" > "$tmp_msg"
+      edit_in_editor "$tmp_msg"
+      msg="$(cat "$tmp_msg")"
+      rm -f "$tmp_msg"
+      msg="$(echo "$msg" | sed 's/^[[:space:]]*//' | grep -v '^$' | head -1)"
+      [[ -z "$msg" ]] && die "Aborted — empty message."
+      git commit -m "$msg"
+      info "Committed: $msg" ;;
+    *) die "Aborted." ;;
+  esac
 }
 
 cmd_branch() {
@@ -202,15 +217,24 @@ $diff"
     "$(printf 'Title: %s\n\n%s' "$title" "$body")"
   echo ""
 
-  if gum confirm "Open PR with this description?"; then
-    gh pr create \
-      --base "$base_branch" \
-      --title "$title" \
-      --body "$body"
-  else
-    info "PR creation skipped. Body saved to /tmp/gitops_pr_body.md"
-    echo "$body" > /tmp/gitops_pr_body.md
-  fi
+  local action
+  action="$(printf 'Open PR\nEdit body\nAbort' | gum choose --header "PR ready:")"
+  case "$action" in
+    "Open PR")
+      gh pr create --base "$base_branch" --title "$title" --body "$body" ;;
+    "Edit body")
+      local tmp_body
+      tmp_body="$(mktemp /tmp/gitops-pr-body.XXXXXX)"
+      printf '%s' "$body" > "$tmp_body"
+      edit_in_editor "$tmp_body"
+      body="$(cat "$tmp_body")"
+      rm -f "$tmp_body"
+      [[ -z "$body" ]] && die "Aborted — empty body."
+      gh pr create --base "$base_branch" --title "$title" --body "$body" ;;
+    *)
+      info "PR creation skipped. Body saved to /tmp/gitops_pr_body.md"
+      echo "$body" > /tmp/gitops_pr_body.md ;;
+  esac
 }
 
 cmd_auto() {
