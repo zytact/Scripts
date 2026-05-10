@@ -6,6 +6,7 @@ set -euo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MODEL="${GITOPS_MODEL:-github-copilot/gpt-5.4-mini}"
+VARIANT="${GITOPS_VARIANT:-low}"
 MAIN_BRANCHES="main master develop"
 
 AGENT_SYSTEM_PROMPT='You are a git workflow assistant. Generate concise conventional commit messages, short kebab-case branch names, and clear GitHub PR descriptions in markdown. Output only the requested artifact — no commentary, no explanations.'
@@ -33,10 +34,10 @@ ${instruction}"
     trap 'rm -f "$ctx_file"' RETURN
     printf '%s' "$context" > "$ctx_file"
     result="$(gum spin --spinner dot --title "Thinking…" -- \
-      opencode run --model "$MODEL" "$full_msg" -f "$ctx_file")"
+      opencode run --model "$MODEL" ${VARIANT:+--variant "$VARIANT"} "$full_msg" -f "$ctx_file")"
   else
     result="$(gum spin --spinner dot --title "Thinking…" -- \
-      opencode run --model "$MODEL" "$full_msg")"
+      opencode run --model "$MODEL" ${VARIANT:+--variant "$VARIANT"} "$full_msg")"
   fi
   echo "$result"
 }
@@ -281,7 +282,8 @@ case "${1:-help}" in
     echo "  auto     Full flow: branch (if on main) → commit → push → pr"
     echo ""
     echo "Env vars:"
-    echo "  GITOPS_MODEL    opencode model string (default: opencode/minimax-m2.5-free)"
+    echo "  GITOPS_MODEL    opencode model string (default: github-copilot/gpt-5.4-mini)"
+    echo "  GITOPS_VARIANT  reasoning effort variant (default: low; set empty to omit)"
     echo "  GITOPS_BASE     base branch for PRs (default: main)"
     ;;
 esac
