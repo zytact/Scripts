@@ -55,6 +55,19 @@ is_main_branch() {
   return 1
 }
 
+detect_base_branch() {
+  local remote_head
+  remote_head="$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null)"
+  if [[ -n "$remote_head" ]]; then
+    echo "${remote_head##*/}"
+    return
+  fi
+  for b in $MAIN_BRANCHES; do
+    git rev-parse --verify "$b" &>/dev/null && echo "$b" && return
+  done
+  die "Cannot detect base branch. Set GITOPS_BASE explicitly."
+}
+
 confirm() {
   # $1 = prompt, returns 0 for yes
   local answer
@@ -161,7 +174,7 @@ cmd_pr() {
 
   local base_branch current
   current="$(current_branch)"
-  base_branch="${GITOPS_BASE:-main}"
+  base_branch="${GITOPS_BASE:-$(detect_base_branch)}"
 
   # Gather context: commits ahead of base + their diffs
   local commits diff context
