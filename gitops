@@ -257,9 +257,15 @@ $diff"
     body="$(run_opencode "Generate a GitHub PR description for the branch context in the attached file. Output only the markdown body." "$context")"
   fi
 
-  # Derive title from first commit or generate fresh
   local title
-  title="$(git log "$base_branch".."$current" --oneline | tail -1 | sed 's/^[a-f0-9]* //' || echo "$current")"
+  if [[ "$NO_AI" -eq 1 ]]; then
+    title="$(git log "$base_branch".."$current" --oneline | tail -1 | sed 's/^[a-f0-9]* //' || echo "$current")"
+    echo ""
+    title="$(gum input --placeholder "PR title" --value "$title")"
+    [[ -z "$title" ]] && die "Aborted — empty title."
+  else
+    title="$(git log "$base_branch".."$current" --oneline | tail -1 | sed 's/^[a-f0-9]* //' || echo "$current")"
+  fi
 
   echo ""
   gum style \
@@ -269,9 +275,19 @@ $diff"
   echo ""
 
   local action
-  action="$(printf 'Open PR\nEdit body\nAbort' | gum choose --header "PR ready:")"
+  action="$(printf 'Open PR\nEdit title\nEdit body\nAbort' | gum choose --header "PR ready:")"
   case "$action" in
     "Open PR")
+      gh pr create --base "$base_branch" --title "$title" --body "$body" ;;
+    "Edit title")
+      local tmp_title
+      tmp_title="$(mktemp /tmp/gitops-pr-title.XXXXXX)"
+      printf '%s' "$title" > "$tmp_title"
+      edit_in_editor "$tmp_title"
+      title="$(cat "$tmp_title")"
+      rm -f "$tmp_title"
+      title="$(echo "$title" | sed 's/^[[:space:]]*//' | grep -v '^$' | head -1)"
+      [[ -z "$title" ]] && die "Aborted — empty title."
       gh pr create --base "$base_branch" --title "$title" --body "$body" ;;
     "Edit body")
       local tmp_body
