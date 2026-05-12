@@ -8,6 +8,7 @@ set -euo pipefail
 MODEL="${GITOPS_MODEL:-github-copilot/gpt-5.4-mini}"
 VARIANT="${GITOPS_VARIANT:-low}"
 MAIN_BRANCHES="main master develop"
+NO_AI=0
 
 AGENT_SYSTEM_PROMPT='You are a git workflow assistant. Generate concise conventional commit messages, short kebab-case branch names, and clear GitHub PR descriptions in markdown. Output only the requested artifact — no commentary, no explanations.'
 
@@ -157,11 +158,16 @@ cmd_commit() {
   local diff
   diff="$(staged_diff)"
 
-  info "Generating commit message…"
   local msg
-  msg="$(run_opencode "Generate a conventional commit message for the staged diff in the attached file." "$diff")"
-
-  msg="$(echo "$msg" | sed 's/^[[:space:]]*//' | head -1)"
+  if [[ "$NO_AI" -eq 1 ]]; then
+    echo ""
+    msg="$(gum input --placeholder "Commit message (conventional commit format)")"
+    [[ -z "$msg" ]] && die "Aborted — empty message."
+  else
+    info "Generating commit message…"
+    msg="$(run_opencode "Generate a conventional commit message for the staged diff in the attached file." "$diff")"
+    msg="$(echo "$msg" | sed 's/^[[:space:]]*//' | head -1)"
+  fi
   echo ""
   echo "  📝 $msg"
   echo ""
@@ -195,11 +201,17 @@ cmd_branch() {
     diff="$(git diff --stat HEAD 2>/dev/null || echo 'new work')"
   }
 
-  info "Generating branch name…"
   local branch
-  branch="$(run_opencode "Generate a branch name for the diff in the attached file. Output ONLY the branch name, nothing else." "$diff")"
-
-  branch="$(echo "$branch" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+  if [[ "$NO_AI" -eq 1 ]]; then
+    echo ""
+    branch="$(gum input --placeholder "Branch name (kebab-case)")"
+    [[ -z "$branch" ]] && die "Aborted — empty branch name."
+    branch="$(echo "$branch" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+  else
+    info "Generating branch name…"
+    branch="$(run_opencode "Generate a branch name for the diff in the attached file. Output ONLY the branch name, nothing else." "$diff")"
+    branch="$(echo "$branch" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+  fi
   echo ""
   echo "  🌿 $branch"
   echo ""
@@ -235,9 +247,15 @@ $commits
 Diff summary:
 $diff"
 
-  info "Generating PR description…"
   local body
-  body="$(run_opencode "Generate a GitHub PR description for the branch context in the attached file. Output only the markdown body." "$context")"
+  if [[ "$NO_AI" -eq 1 ]]; then
+    echo ""
+    body="$(gum write --placeholder "PR description (markdown)" --width 80 --height 15)"
+    [[ -z "$body" ]] && die "Aborted — empty PR body."
+  else
+    info "Generating PR description…"
+    body="$(run_opencode "Generate a GitHub PR description for the branch context in the attached file. Output only the markdown body." "$context")"
+  fi
 
   # Derive title from first commit or generate fresh
   local title
@@ -298,7 +316,17 @@ cmd_auto() {
 }
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
-require git opencode gum
+# Parse flags before the subcommand
+ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --no-ai) NO_AI=1 ;;
+    *) ARGS+=("$arg") ;;
+  esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+[[ "$NO_AI" -eq 0 ]] && require git opencode gum || require git gum
 
 case "${1:-help}" in
   commit) cmd_commit ;;
@@ -306,12 +334,15 @@ case "${1:-help}" in
   pr)     cmd_pr ;;
   auto)   cmd_auto ;;
   *)
-    echo "Usage: gitops <command>"
+    echo "Usage: gitops [--no-ai] <command>"
     echo ""
     echo "  commit   Pick files to stage, generate commit message, and commit"
     echo "  branch   Generate and checkout a new branch (feat/fix/chore/…)"
     echo "  pr       Generate PR description and open with gh cli"
     echo "  auto     Full flow: branch (if on main) → commit → push → pr"
+    echo ""
+    echo "Flags:"
+    echo "  --no-ai  Skip AI generation; enter commit message / branch name / PR body manually"
     echo ""
     echo "Env vars:"
     echo "  GITOPS_MODEL    opencode model string (default: github-copilot/gpt-5.4-mini)"
