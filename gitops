@@ -250,8 +250,7 @@ $diff"
   local body
   if [[ "$NO_AI" -eq 1 ]]; then
     echo ""
-    body="$(gum write --placeholder "PR description (markdown)" --width 80 --height 15)"
-    [[ -z "$body" ]] && die "Aborted — empty PR body."
+    body="$(gum write --placeholder "PR description (markdown) (leave empty to skip)" --width 80 --height 15)"
   else
     info "Generating PR description…"
     body="$(run_opencode "Generate a GitHub PR description for the branch context in the attached file. Output only the markdown body." "$context")"
@@ -296,7 +295,6 @@ $diff"
       edit_in_editor "$tmp_body"
       body="$(cat "$tmp_body")"
       rm -f "$tmp_body"
-      [[ -z "$body" ]] && die "Aborted — empty body."
       gh pr create --base "$base_branch" --title "$title" --body "$body" ;;
     *)
       info "PR creation skipped. Body saved to /tmp/gitops_pr_body.md"
