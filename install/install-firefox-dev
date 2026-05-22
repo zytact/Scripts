@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+
+set -e
+
+DRY_RUN=false
+FORCE=false
+TAR_FILE=""
+for arg in "$@"; do
+    case "$arg" in
+        -f|--force)   FORCE=true ;;
+        -n|--dry-run) DRY_RUN=true ;;
+        -*)           gum log --level error "Unknown option: $arg"; exit 1 ;;
+        *)            TAR_FILE="$arg" ;;
+    esac
+done
+
+if [ -z "$TAR_FILE" ]; then
+    gum log --level error "Usage: $(basename "$0") [--force] [--dry-run] <path-to-tar>"
+    exit 1
+fi
+
+TAR_BASENAME="$(basename "$TAR_FILE")"
+VERSION="$(echo "$TAR_BASENAME" | grep -oP '[\d]+\.[\d]+[a-zA-Z0-9.]*(?=\.tar)')"
+if [ -z "$VERSION" ]; then
+    gum log --level error "Could not derive version from filename: $TAR_BASENAME"
+    exit 1
+fi
+INSTALL_DIR="/opt/firefox-dev"
+DESKTOP_FILE="$HOME/.local/share/applications/firefox-dev.desktop"
+APP_NAME="Firefox Developer Edition"
+
+gum style --bold --foreground 212 "Firefox Developer Edition Installer"
+
+if [ ! -f "$TAR_FILE" ]; then
+    gum log --level error "Archive not found: $TAR_FILE"
+    exit 1
+fi
+
+VERSION_FILE="$INSTALL_DIR/.installed_version"
+if [ -f "$VERSION_FILE" ]; then
+    INSTALLED_VERSION=$(cat "$VERSION_FILE")
+    if [ "$INSTALLED_VERSION" = "$VERSION" ]; then
+        if [ "$FORCE" = true ]; then
+            gum log --level warn "${APP_NAME} ${VERSION} already installed — forcing reinstall."
+        else
+            gum log --level info "${APP_NAME} is already up to date (${VERSION})."
+            exit 0
+        fi
+    else
+        gum log --level warn "Installed: ${INSTALLED_VERSION} → New: ${VERSION}"
+    fi
+else
+    gum log --level info "Version to install: ${VERSION}"
+fi
+
+echo ""
+gum confirm "Proceed with installation?" || { echo "Installation cancelled."; exit 0; }
+
+if [ "$DRY_RUN" = true ]; then
+    gum log --level info "[dry run] Simulating installation..."
+    gum spin --spinner jump   --title "[dry run] Extracting archive..."             -- sleep 1
+    gum spin --spinner points --title "[dry run] Installing to $INSTALL_DIR..."     -- sleep 1
+    gum log --level warn "[dry run] Would write desktop entry to $DESKTOP_FILE"
+    gum spin --spinner pulse  --title "[dry run] Updating desktop database..."      -- sleep 1
+    gum log --level info "[dry run] Done! Would have installed ${APP_NAME} ${VERSION} to ${INSTALL_DIR}"
+    exit 0
+fi
+
+TEMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TEMP_DIR"' EXIT
+
+gum spin --spinner jump --title "Extracting archive..." -- tar -xf "$TAR_FILE" -C "$TEMP_DIR"
+
+EXTRACTED=$(find "$TEMP_DIR" -maxdepth 1 -mindepth 1 -type d | head -n 1)
+if [ -z "$EXTRACTED" ]; then
+    gum log --level error "No directory found after extraction"
+    exit 1
+fi
+
+if [ -d "$INSTALL_DIR" ]; then
+    gum spin --spinner dot --title "Removing existing installation at $INSTALL_DIR..." -- sudo rm -rf "$INSTALL_DIR"
+fi
+
+gum spin --spinner points --title "Installing to $INSTALL_DIR..." -- sudo mv "$EXTRACTED" "$INSTALL_DIR"
+
+mkdir -p "$(dirname "$DESKTOP_FILE")"
+
+gum log --level info "Creating desktop entry..."
+cat > "$DESKTOP_FILE" <<EOF
+[Desktop Entry]
+Name=${APP_NAME}
+Exec=${INSTALL_DIR}/firefox %U
+Type=Application
+Icon=${INSTALL_DIR}/browser/chrome/icons/default/default128.png
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=application/pdf;application/rdf+xml;application/rss+xml;application/xhtml+xml;application/xhtml_xml;application/xml;image/gif;image/jpeg;image/png;image/webp;text/html;text/xml;x-scheme-handler/http;x-scheme-handler/https;
+StartupNotify=true
+EOF
+
+chmod +x "$DESKTOP_FILE"
+
+if command -v update-desktop-database &>/dev/null; then
+    gum spin --spinner pulse --title "Updating desktop database..." -- update-desktop-database "$(dirname "$DESKTOP_FILE")"
+fi
+
+echo "$VERSION" | sudo tee "$INSTALL_DIR/.installed_version" > /dev/null
+
+gum log --level info "Done! ${APP_NAME} ${VERSION} installed to ${INSTALL_DIR}"
