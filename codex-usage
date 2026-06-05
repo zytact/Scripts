@@ -1,6 +1,41 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+MODE="pretty"
+
+usage() {
+  cat <<'EOF'
+Usage: codex-usage [--json|--shell]
+
+Options:
+  --json   Print machine-readable JSON instead of the formatted dashboard
+  --shell  Print shell-friendly KEY=VALUE lines
+  -h, --help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json)
+      MODE="json"
+      shift
+      ;;
+    --shell)
+      MODE="shell"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
 AUTH_FILE="${CODEX_HOME:-$HOME/.codex}/auth.json"
 
 if ! command -v jq >/dev/null 2>&1; then
@@ -192,6 +227,79 @@ SECONDARY_RESET_SECONDS="$(jq -r '
 
 LIMIT_REACHED="$(jq -r '.rate_limit.limit_reached // false' "$TMP")"
 ALLOWED="$(jq -r '.rate_limit.allowed // true' "$TMP")"
+
+now_epoch="$(date +%s)"
+
+normalize_seconds() {
+  local seconds="${1:-}"
+
+  if [[ -z "$seconds" || "$seconds" == "null" ]]; then
+    echo ""
+    return
+  fi
+
+  printf '%s\n' "${seconds%.*}"
+}
+
+PRIMARY_RESET_SECONDS="$(normalize_seconds "$PRIMARY_RESET_SECONDS")"
+SECONDARY_RESET_SECONDS="$(normalize_seconds "$SECONDARY_RESET_SECONDS")"
+
+PRIMARY_RESET_AT_EPOCH=""
+SECONDARY_RESET_AT_EPOCH=""
+
+if [[ -n "$PRIMARY_RESET_SECONDS" ]]; then
+  PRIMARY_RESET_AT_EPOCH=$(( now_epoch + PRIMARY_RESET_SECONDS ))
+fi
+
+if [[ -n "$SECONDARY_RESET_SECONDS" ]]; then
+  SECONDARY_RESET_AT_EPOCH=$(( now_epoch + SECONDARY_RESET_SECONDS ))
+fi
+
+if [[ "$MODE" == "json" ]]; then
+  jq -n \
+    --argjson now_epoch "$now_epoch" \
+    --argjson limit_reached "$( [[ "$LIMIT_REACHED" == "true" ]] && echo true || echo false )" \
+    --argjson allowed "$( [[ "$ALLOWED" == "true" ]] && echo true || echo false )" \
+    --arg primary_used "${PRIMARY_USED:-}" \
+    --arg secondary_used "${SECONDARY_USED:-}" \
+    --arg primary_reset_seconds "${PRIMARY_RESET_SECONDS:-}" \
+    --arg secondary_reset_seconds "${SECONDARY_RESET_SECONDS:-}" \
+    --arg primary_reset_at_epoch "${PRIMARY_RESET_AT_EPOCH:-}" \
+    --arg secondary_reset_at_epoch "${SECONDARY_RESET_AT_EPOCH:-}" \
+    '{
+      now_epoch: $now_epoch,
+      limit_reached: $limit_reached,
+      allowed: $allowed,
+      rate_limit: {
+        primary_window: {
+          used_percent: ($primary_used | if . == "" then null else (tonumber? // .) end),
+          reset_after_seconds: ($primary_reset_seconds | if . == "" then null else (tonumber? // .) end),
+          reset_at_epoch: ($primary_reset_at_epoch | if . == "" then null else (tonumber? // .) end)
+        },
+        secondary_window: {
+          used_percent: ($secondary_used | if . == "" then null else (tonumber? // .) end),
+          reset_after_seconds: ($secondary_reset_seconds | if . == "" then null else (tonumber? // .) end),
+          reset_at_epoch: ($secondary_reset_at_epoch | if . == "" then null else (tonumber? // .) end)
+        }
+      }
+    }'
+  exit 0
+fi
+
+if [[ "$MODE" == "shell" ]]; then
+  cat <<EOF
+NOW_EPOCH=$now_epoch
+LIMIT_REACHED=$LIMIT_REACHED
+ALLOWED=$ALLOWED
+PRIMARY_USED=${PRIMARY_USED:-}
+PRIMARY_RESET_SECONDS=${PRIMARY_RESET_SECONDS:-}
+PRIMARY_RESET_AT_EPOCH=${PRIMARY_RESET_AT_EPOCH:-}
+SECONDARY_USED=${SECONDARY_USED:-}
+SECONDARY_RESET_SECONDS=${SECONDARY_RESET_SECONDS:-}
+SECONDARY_RESET_AT_EPOCH=${SECONDARY_RESET_AT_EPOCH:-}
+EOF
+  exit 0
+fi
 
 print_window() {
   local title="$1"
