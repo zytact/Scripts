@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+AUTH_FILE="${CODEX_HOME:-$HOME/.codex}/auth.json"
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "Missing jq. Install it:"
+  echo "  sudo dnf install jq"
+  exit 1
+fi
+
+if [[ ! -f "$AUTH_FILE" ]]; then
+  echo "Codex auth file not found: $AUTH_FILE"
+  exit 1
+fi
+
+# Colors
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+RESET=$'\033[0m'
+RED=$'\033[31m'
+GREEN=$'\033[32m'
+YELLOW=$'\033[33m'
+BLUE=$'\033[34m'
+MAGENTA=$'\033[35m'
+CYAN=$'\033[36m'
+WHITE=$'\033[37m'
+
+BRIGHT_RED=$'\033[91m'
+BRIGHT_GREEN=$'\033[92m'
+BRIGHT_YELLOW=$'\033[93m'
+BRIGHT_BLUE=$'\033[94m'
+BRIGHT_MAGENTA=$'\033[95m'
+BRIGHT_CYAN=$'\033[96m'
+
+ACCESS_TOKEN="$(jq -r '
+  .tokens.access_token
+  // .tokens.access
+  // .access_token
+  // .access
+  // .chatgptAuthTokens.access_token
+  // .chatgpt_auth.access_token
+  // empty
+' "$AUTH_FILE")"
+
+ACCOUNT_ID="$(jq -r '
+  .account_id
+  // .accountId
+  // .tokens.account_id
+  // .tokens.accountId
+  // .chatgpt_account_id
+  // .chatgptAccountId
+  // empty
+' "$AUTH_FILE")"
+
+if [[ -z "$ACCESS_TOKEN" || "$ACCESS_TOKEN" == "null" ]]; then
+  echo "Could not find access token in $AUTH_FILE"
+  exit 1
+fi
+
+fmt_eta() {
+  local seconds="$1"
+
+  if [[ -z "$seconds" || "$seconds" == "null" ]]; then
+    echo "unknown"
+    return
+  fi
+
+  seconds="${seconds%.*}"
+
+  if (( seconds <= 0 )); then
+    echo "resetting now"
+    return
+  fi
+
+  local d=$(( seconds / 86400 ))
+  local h=$(( (seconds % 86400) / 3600 ))
+  local m=$(( (seconds % 3600) / 60 ))
+
+  if (( d > 0 )); then
+    echo "${d}d ${h}h ${m}m"
+  elif (( h > 0 )); then
+    echo "${h}h ${m}m"
+  else
+    echo "${m}m"
+  fi
+}
+
+fmt_abs_time_from_reset_seconds() {
+  local seconds="$1"
+
+  if [[ -z "$seconds" || "$seconds" == "null" ]]; then
+    echo "unknown"
+    return
+  fi
+
+  seconds="${seconds%.*}"
+  local target=$(( $(date +%s) + seconds ))
+
+  date -d "@$target" "+%a, %d %b %I:%M %p" 2>/dev/null \
+    || date -r "$target" "+%a, %d %b %I:%M %p"
+}
+
+usage_color() {
+  local used="${1%.*}"
+
+  if (( used < 40 )); then
+    echo "$BRIGHT_GREEN"
+  elif (( used < 70 )); then
+    echo "$BRIGHT_YELLOW"
+  elif (( used < 90 )); then
+    echo "$YELLOW"
+  else
+    echo "$BRIGHT_RED"
+  fi
+}
+
+bar() {
+  local used="${1%.*}"
+  local width=24
+  local filled=$(( used * width / 100 ))
+  local empty=$(( width - filled ))
+  local color
+  color="$(usage_color "$used")"
+
+  printf "%s" "$color"
+  printf "%0.s█" $(seq 1 "$filled" 2>/dev/null)
+  printf "%s" "$DIM"
+  printf "%0.s░" $(seq 1 "$empty" 2>/dev/null)
+  printf "%s" "$RESET"
+}
+
+fetch_usage() {
+  local url="$1"
+
+  if [[ -n "$ACCOUNT_ID" && "$ACCOUNT_ID" != "null" ]]; then
+    curl -fsS "$url" \
+      -H "Authorization: Bearer $ACCESS_TOKEN" \
+      -H "chatgpt-account-id: $ACCOUNT_ID" \
+      -H "accept: application/json"
+  else
+    curl -fsS "$url" \
+      -H "Authorization: Bearer $ACCESS_TOKEN" \
+      -H "accept: application/json"
+  fi
+}
+
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+
+if ! fetch_usage "https://chatgpt.com/backend-api/wham/usage" > "$TMP"; then
+  if ! fetch_usage "https://chatgpt.com/backend-api/codex/usage" > "$TMP"; then
+    echo "Usage request failed."
+    exit 1
+  fi
+fi
+
+PRIMARY_USED="$(jq -r '.rate_limit.primary_window.used_percent // empty' "$TMP")"
+SECONDARY_USED="$(jq -r '.rate_limit.secondary_window.used_percent // empty' "$TMP")"
+
+PRIMARY_RESET_SECONDS="$(jq -r '
+  .rate_limit.primary_window.reset_after_seconds
+  // (
+    if .rate_limit.primary_window.reset_at then
+      (
+        (
+          if .rate_limit.primary_window.reset_at > 100000000000
+          then .rate_limit.primary_window.reset_at / 1000
+          else .rate_limit.primary_window.reset_at
+          end
+        ) - now
+      )
+    else empty end
+  )
+' "$TMP")"
+
+SECONDARY_RESET_SECONDS="$(jq -r '
+  .rate_limit.secondary_window.reset_after_seconds
+  // (
+    if .rate_limit.secondary_window.reset_at then
+      (
+        (
+          if .rate_limit.secondary_window.reset_at > 100000000000
+          then .rate_limit.secondary_window.reset_at / 1000
+          else .rate_limit.secondary_window.reset_at
+          end
+        ) - now
+      )
+    else empty end
+  )
+' "$TMP")"
+
+LIMIT_REACHED="$(jq -r '.rate_limit.limit_reached // false' "$TMP")"
+ALLOWED="$(jq -r '.rate_limit.allowed // true' "$TMP")"
+
+print_window() {
+  local title="$1"
+  local used="$2"
+  local reset_seconds="$3"
+
+  [[ -z "$used" ]] && return
+
+  local used_round
+  local color
+  used_round="$(awk "BEGIN { printf \"%.0f\", $used }")"
+  color="$(usage_color "$used_round")"
+
+  echo "${BOLD}${BRIGHT_MAGENTA}╭──────────────────────────────╮${RESET}"
+  printf "${BOLD}${BRIGHT_MAGENTA}│${RESET} ${BOLD}${BRIGHT_CYAN}%-28s${RESET} ${BOLD}${BRIGHT_MAGENTA}│${RESET}\n" "$title"
+  echo "${BOLD}${BRIGHT_MAGENTA}╰──────────────────────────────╯${RESET}"
+
+  echo "  ${DIM}Usage${RESET}   $(bar "$used_round")  ${color}${BOLD}${used_round}% used${RESET}"
+  echo "  ${DIM}Reset${RESET}   ${BRIGHT_GREEN}in $(fmt_eta "$reset_seconds")${RESET}"
+  echo "  ${DIM}At${RESET}      ${BRIGHT_BLUE}$(fmt_abs_time_from_reset_seconds "$reset_seconds")${RESET}"
+  echo
+}
+
+clear
+echo "${BOLD}${BRIGHT_CYAN}╔══════════════════════════════╗${RESET}"
+echo "${BOLD}${BRIGHT_CYAN}║        CODEX  USAGE          ║${RESET}"
+echo "${BOLD}${BRIGHT_CYAN}╚══════════════════════════════╝${RESET}"
+echo
+
+if [[ "$LIMIT_REACHED" == "true" || "$ALLOWED" == "false" ]]; then
+  echo "${BOLD}${BRIGHT_RED}⚠ LIMIT REACHED${RESET}"
+  echo
+fi
+
+if [[ -z "$PRIMARY_USED" && -z "$SECONDARY_USED" ]]; then
+  echo "${BRIGHT_RED}No usage windows found.${RESET}"
+  exit 1
+fi
+
+print_window "5h window" "$PRIMARY_USED" "$PRIMARY_RESET_SECONDS"
+print_window "7d window" "$SECONDARY_USED" "$SECONDARY_RESET_SECONDS"

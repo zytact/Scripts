@@ -2,7 +2,7 @@
 set -eu
 
 desktop_file="${1:-/usr/share/applications/codex-desktop.desktop}"
-codex_cli_path="${CODEX_CLI_PATH_OVERRIDE:-/home/arnab/.local/share/fnm/node-versions/v22.19.0/installation/bin/codex}"
+codex_cli_path="${CODEX_CLI_PATH_OVERRIDE:-/home/arnab/.vite-plus/bin/codex}"
 
 if [ ! -f "$desktop_file" ]; then
     printf 'Desktop file does not exist yet: %s\n' "$desktop_file" >&2
