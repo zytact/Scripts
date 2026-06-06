@@ -1,0 +1,731 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! command -v gum >/dev/null 2>&1; then
+  echo "Missing gum. Install it first."
+  exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "Missing python3."
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+render_report() {
+  local scope="$1"
+  python3 - "$scope" <<'PY'
+import datetime as dt
+import json
+import os
+import re
+import sys
+import urllib.request
+from collections import Counter, defaultdict
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+
+SCOPE = sys.argv[1]
+HOME = Path.home()
+NOW = dt.datetime.now().astimezone()
+TODAY = NOW.date()
+
+CODEX_DIR = HOME / ".codex" / "sessions"
+PI_LINK = HOME / ".pi"
+PI_HOME = PI_LINK.resolve() if PI_LINK.exists() else PI_LINK
+PI_DIR = PI_HOME / "agent" / "sessions"
+
+ACTIVE_GAP_SECONDS = 15 * 60
+EXTENSION_LANGS = {
+    ".py": "Python",
+    ".ts": "TypeScript",
+    ".tsx": "TSX",
+    ".js": "JavaScript",
+    ".jsx": "JSX",
+    ".rs": "Rust",
+    ".go": "Go",
+    ".java": "Java",
+    ".c": "C",
+    ".cc": "C++",
+    ".cpp": "C++",
+    ".h": "C/C++ Header",
+    ".hpp": "C++ Header",
+    ".sh": "Shell",
+    ".zsh": "Shell",
+    ".bash": "Shell",
+    ".json": "JSON",
+    ".jsonl": "JSONL",
+    ".toml": "TOML",
+    ".yaml": "YAML",
+    ".yml": "YAML",
+    ".md": "Markdown",
+    ".html": "HTML",
+    ".css": "CSS",
+    ".scss": "SCSS",
+    ".sql": "SQL",
+    ".lua": "Lua",
+    ".rb": "Ruby",
+    ".php": "PHP",
+    ".swift": "Swift",
+    ".kt": "Kotlin",
+    ".tsx": "TSX",
+    ".tsx": "TSX",
+}
+
+FILE_PATH_RE = re.compile(r'([/~]?[A-Za-z0-9._/\- ]+\.[A-Za-z0-9]+)')
+MODELS_DEV_URL = "https://raw.githubusercontent.com/anomalyco/models.dev/dev/models.json"
+MODEL_ALIASES = {
+    "gpt-5.3-codex": "openai/gpt-5.3-codex",
+    "gpt-5.4": "openai/gpt-5.4",
+    "gpt-5.4-mini": "openai/gpt-5.4-mini",
+    "gpt-5.5": "openai/gpt-5.5",
+    "deepseek-v4-flash-free": "deepseek/deepseek-v4-flash:free",
+    "deepseek-v4-flash": "deepseek/deepseek-v4-flash",
+}
+
+
+def parse_ts(value: str) -> dt.datetime | None:
+    try:
+        return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone()
+    except Exception:
+        return None
+
+
+def scope_start(scope: str) -> dt.datetime:
+    if scope == "today":
+        return NOW.replace(hour=0, minute=0, second=0, microsecond=0)
+    if scope == "7d":
+        start_day = TODAY - dt.timedelta(days=6)
+        return dt.datetime.combine(start_day, dt.time.min, NOW.tzinfo)
+    if scope == "month":
+        start_day = TODAY.replace(day=1)
+        return dt.datetime.combine(start_day, dt.time.min, NOW.tzinfo)
+    raise ValueError(f"unknown scope: {scope}")
+
+
+def repo_name(cwd: str | None) -> str:
+    if not cwd:
+        return "unknown"
+    parts = Path(cwd).parts
+    if "Projects" in parts:
+        idx = parts.index("Projects")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    if "dotfiles" in parts:
+        idx = parts.index("dotfiles")
+        if idx + 1 < len(parts):
+            return f"dotfiles/{parts[idx + 1]}"
+    return Path(cwd).name or cwd
+
+
+def infer_languages(text: str) -> Counter:
+    counts: Counter[str] = Counter()
+    for match in FILE_PATH_RE.findall(text):
+        ext = Path(match.strip()).suffix.lower()
+        lang = EXTENSION_LANGS.get(ext)
+        if lang:
+            counts[lang] += 1
+    return counts
+
+
+def merge_counter(target: Counter, source: Counter) -> None:
+    for key, value in source.items():
+        target[key] += value
+
+
+def iter_jsonl_files(root: Path):
+    if not root.exists():
+        return []
+    return sorted(root.rglob("*.jsonl"))
+
+
+def codex_session_stats(path: Path):
+    session_id = None
+    cwd = None
+    events: list[dt.datetime] = []
+    token_total = {"input": 0, "cached": 0, "output": 0, "reasoning": 0, "total": 0}
+    langs: Counter[str] = Counter()
+    model_counts: Counter[str] = Counter()
+    effort_counts: Counter[str] = Counter()
+
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            langs.update(infer_languages(line))
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(item, dict):
+                continue
+            ts = parse_ts(item.get("timestamp", ""))
+            if ts:
+                events.append(ts)
+            if item.get("type") == "session_meta":
+                payload = item.get("payload") or {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                session_id = payload.get("id")
+                cwd = payload.get("cwd")
+            payload = item.get("payload") or {}
+            if not isinstance(payload, dict):
+                payload = {}
+            if item.get("type") == "turn_context":
+                model_name = payload.get("model")
+                if model_name:
+                    model_counts[str(model_name)] += 1
+                effort_name = payload.get("effort")
+                if effort_name:
+                    effort_counts[str(effort_name)] += 1
+                collaboration = payload.get("collaboration_mode") or {}
+                if isinstance(collaboration, dict):
+                    settings = collaboration.get("settings") or {}
+                    if isinstance(settings, dict):
+                        setting_effort = settings.get("reasoning_effort")
+                        if setting_effort and not effort_name:
+                            effort_counts[str(setting_effort)] += 1
+            if item.get("type") == "event_msg" and payload.get("type") == "token_count":
+                info = payload.get("info") or {}
+                if not isinstance(info, dict):
+                    info = {}
+                info = info.get("total_token_usage") or {}
+                if not isinstance(info, dict):
+                    info = {}
+                token_total = {
+                    "input": int(info.get("input_tokens", 0) or 0),
+                    "cached": int(info.get("cached_input_tokens", 0) or 0),
+                    "output": int(info.get("output_tokens", 0) or 0),
+                    "reasoning": int(info.get("reasoning_output_tokens", 0) or 0),
+                    "total": int(info.get("total_tokens", 0) or 0),
+                }
+
+    if not events:
+        return None
+    events.sort()
+    active = 0
+    for prev, cur in zip(events, events[1:]):
+        delta = int((cur - prev).total_seconds())
+        if delta > 0:
+            active += min(delta, ACTIVE_GAP_SECONDS)
+    if active == 0:
+        active = 60
+
+    model_tokens: dict[str, dict[str, int]] = {}
+    total_model_marks = sum(model_counts.values()) or 0
+    if total_model_marks > 0:
+        for model_name, marks in model_counts.items():
+            ratio = marks / total_model_marks
+            model_tokens[model_name] = {
+                "input": int(token_total.get("input", 0) * ratio),
+                "cached": int(token_total.get("cached", 0) * ratio),
+                "output": int(token_total.get("output", 0) * ratio),
+                "total": int(token_total.get("total", 0) * ratio),
+            }
+
+    return {
+        "source": "codex",
+        "session_id": session_id or path.stem,
+        "cwd": cwd,
+        "repo": repo_name(cwd),
+        "start": events[0],
+        "end": events[-1],
+        "active_seconds": active,
+        "tokens": token_total,
+        "languages": langs,
+        "models": model_counts,
+        "efforts": effort_counts,
+        "model_tokens": model_tokens,
+        "path": str(path),
+    }
+
+
+def pi_session_stats(path: Path):
+    session_id = None
+    cwd = None
+    events: list[dt.datetime] = []
+    tokens = {"input": 0, "cached": 0, "output": 0, "reasoning": 0, "total": 0}
+    langs: Counter[str] = Counter()
+    model_counts: Counter[str] = Counter()
+    effort_counts: Counter[str] = Counter()
+    model_tokens: dict[str, dict[str, int]] = defaultdict(lambda: {"input": 0, "cached": 0, "output": 0, "total": 0})
+
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            langs.update(infer_languages(line))
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(item, dict):
+                continue
+            ts = parse_ts(item.get("timestamp", ""))
+            if ts:
+                events.append(ts)
+            if item.get("type") == "session":
+                session_id = item.get("id")
+                cwd = item.get("cwd")
+            if item.get("type") == "model_change":
+                model_id = item.get("modelId")
+                if model_id:
+                    model_counts[str(model_id)] += 1
+            if item.get("type") == "thinking_level_change":
+                level = item.get("thinkingLevel")
+                if level:
+                    effort_counts[str(level)] += 1
+            if item.get("type") == "message":
+                message = item.get("message") or {}
+                if not isinstance(message, dict):
+                    message = {}
+                model_name = message.get("model")
+                if model_name:
+                    model_counts[str(model_name)] += 1
+                usage = message.get("usage") or {}
+                if not isinstance(usage, dict):
+                    usage = {}
+                if model_name:
+                    bucket = model_tokens[str(model_name)]
+                    bucket["input"] += int(usage.get("input", 0) or 0)
+                    bucket["cached"] += int(usage.get("cacheRead", 0) or 0)
+                    bucket["output"] += int(usage.get("output", 0) or 0)
+                    bucket["total"] += int(usage.get("totalTokens", 0) or 0)
+                tokens["input"] += int(usage.get("input", 0) or 0)
+                tokens["cached"] += int(usage.get("cacheRead", 0) or 0)
+                tokens["output"] += int(usage.get("output", 0) or 0)
+                tokens["total"] += int(usage.get("totalTokens", 0) or 0)
+
+    if not events:
+        return None
+    events.sort()
+    active = 0
+    for prev, cur in zip(events, events[1:]):
+        delta = int((cur - prev).total_seconds())
+        if delta > 0:
+            active += min(delta, ACTIVE_GAP_SECONDS)
+    if active == 0:
+        active = 60
+
+    return {
+        "source": "pi",
+        "session_id": session_id or path.stem,
+        "cwd": cwd,
+        "repo": repo_name(cwd),
+        "start": events[0],
+        "end": events[-1],
+        "active_seconds": active,
+        "tokens": tokens,
+        "languages": langs,
+        "models": model_counts,
+        "efforts": effort_counts,
+        "model_tokens": dict(model_tokens),
+        "path": str(path),
+    }
+
+
+def collect_sessions():
+    sessions = []
+    for path in iter_jsonl_files(CODEX_DIR):
+        stat = codex_session_stats(path)
+        if stat:
+            sessions.append(stat)
+    for path in iter_jsonl_files(PI_DIR):
+        stat = pi_session_stats(path)
+        if stat:
+            sessions.append(stat)
+    return sessions
+
+
+def filter_sessions(sessions, start):
+    return [s for s in sessions if s["end"] >= start]
+
+
+def human_seconds(total: int) -> str:
+    hours, rem = divmod(total, 3600)
+    mins, _ = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
+
+
+def compact_tokens(value: int) -> str:
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}k"
+    return str(value)
+
+
+def color(text: str, code: str) -> str:
+    return f"\033[{code}m{text}\033[0m"
+
+
+def dim(text: str) -> str:
+    return color(text, "2")
+
+
+def bold(text: str) -> str:
+    return color(text, "1")
+
+
+def bar(value: int, max_value: int, width: int = 22, color_code: str = "96") -> str:
+    if max_value <= 0:
+        filled = 0
+    else:
+        filled = round((value / max_value) * width)
+    if value > 0 and filled == 0:
+        filled = 1
+    filled = max(0, min(width, filled))
+    empty = width - filled
+    return color("█" * filled, color_code) + dim("░" * empty)
+
+
+def metric_line(label: str, value: str, accent: str = "97") -> str:
+    return f"  {dim(label.ljust(14))} {color(value, accent)}"
+
+
+def list_block(title: str, rows: list[tuple[str, str]], accent: str) -> list[str]:
+    out = [f"  {color(title, accent)}"]
+    if not rows:
+        out.append(f"    {dim('none')}")
+        return out
+    max_value = max((len(value) for _, value in rows), default=1)
+    for name, value in rows:
+        out.append(f"    {color('•', accent)} {bold(name)} {dim('·')} {color(value, '97')}")
+    return out
+
+
+def percent_rows(counter: Counter, limit: int = 5) -> list[tuple[str, str]]:
+    total = sum(counter.values())
+    if total <= 0:
+        return []
+    rows = []
+    for name, count in sorted_top(counter, limit):
+        pct = (count / total) * 100
+        rows.append((name, f"{pct:.0f}%"))
+    return rows
+
+
+def load_pricing_map():
+    try:
+        req = urllib.request.Request(MODELS_DEV_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=20) as response:
+            payload = json.load(response)
+    except Exception:
+        return {}
+
+    out = {}
+    for item in payload.get("data", []):
+        if not isinstance(item, dict):
+            continue
+        pricing = item.get("pricing") or {}
+        if not isinstance(pricing, dict):
+            pricing = {}
+        out[str(item.get("id"))] = {
+            "name": item.get("name") or item.get("id"),
+            "prompt": pricing.get("prompt"),
+            "completion": pricing.get("completion"),
+            "cache_read": pricing.get("input_cache_read"),
+        }
+    return out
+
+
+def as_decimal(value):
+    if value in (None, "", "null"):
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def estimate_cost_breakdown_usd(model_name: str, token_info: dict, pricing_map: dict) -> dict | None:
+    model_id = MODEL_ALIASES.get(model_name, model_name)
+    pricing = pricing_map.get(model_id)
+    if not pricing:
+        return None
+    prompt = as_decimal(pricing.get("prompt")) or Decimal("0")
+    completion = as_decimal(pricing.get("completion")) or Decimal("0")
+    cache_read = as_decimal(pricing.get("cache_read")) or Decimal("0")
+    input_tokens = Decimal(token_info.get("input", 0) or 0)
+    output_tokens = Decimal(token_info.get("output", 0) or 0)
+    cached_tokens = Decimal(token_info.get("cached", 0) or 0)
+    input_cost = input_tokens * prompt
+    cache_cost = cached_tokens * cache_read
+    output_cost = output_tokens * completion
+    total_cost = input_cost + cache_cost + output_cost
+    return {
+        "input": input_cost,
+        "cached": cache_cost,
+        "output": output_cost,
+        "total": total_cost,
+    }
+
+
+def usd(value: Decimal | None) -> str:
+    if value is None:
+        return "n/a"
+    if value == 0:
+        return "$0.00"
+    if value < Decimal("0.01"):
+        return f"${value:.4f}"
+    return f"${value:.2f}"
+
+
+def usd_per_million(value: Decimal | None) -> str:
+    if value is None:
+        return "n/a"
+    per_million = value * Decimal("1000000")
+    if per_million == 0:
+        return "$0/M"
+    if per_million < Decimal("0.01"):
+        return f"${per_million:.4f}/M"
+    if per_million < Decimal("1"):
+        return f"${per_million:.3f}/M"
+    return f"${per_million:.2f}/M"
+
+
+def usage_rows(counter: Counter, limit: int = 5) -> list[tuple[str, str, float]]:
+    total = sum(counter.values())
+    if total <= 0:
+        return []
+    rows = []
+    for name, count in sorted_top(counter, limit):
+        pct = (count / total) * 100
+        rows.append((name, f"{pct:.0f}%", pct))
+    return rows
+
+
+def model_rows(stats: dict, pricing_map: dict, limit: int = 5) -> list[tuple[str, str, float]]:
+    total = sum(stats["model_usage"].values())
+    if total <= 0:
+        return []
+    rows = []
+    for model, count in sorted_top(stats["model_usage"], limit):
+        pct = (count / total) * 100
+        token_info = stats["model_tokens"].get(model, {})
+        model_id = MODEL_ALIASES.get(model, model)
+        pricing = pricing_map.get(model_id) or {}
+        prompt_rate = usd_per_million(as_decimal(pricing.get("prompt")))
+        completion_rate = usd_per_million(as_decimal(pricing.get("completion")))
+        rows.append((
+            model,
+            f"{pct:.0f}% · in {compact_tokens(token_info.get('input', 0))} ({prompt_rate})"
+            f" · out {compact_tokens(token_info.get('output', 0))} ({completion_rate})",
+            pct,
+        ))
+    return rows
+
+
+def glam_bar_list_block(title: str, rows: list[tuple[str, str, float]], accent: str, glow: str, badge: str, note: str | None = None) -> list[str]:
+    out = [
+        f"  {color('╭─ ' + badge + ' ' + title.upper(), '1;' + glow)}",
+        f"  {color('│', accent)} {dim(note)}" if note else None,
+    ]
+    out = [line for line in out if line is not None]
+    if not rows:
+        out.append(f"  {color('│', accent)} {dim('none')}")
+        out.append(f"  {color('╰────────────────────────────────────────────────────', accent)}")
+        return out
+    for name, label, value in rows:
+        out.append(f"  {color('│', accent)} {color('◆', glow)} {bold(name)}")
+        out.append(f"  {color('│', accent)}   {bar(int(round(value)), 100, width=22, color_code=glow)} {color(label, '97')}")
+    out.append(f"  {color('╰────────────────────────────────────────────────────', accent)}")
+    return out
+
+
+def aggregate(sessions):
+    data = {
+        "active_seconds": 0,
+        "session_count": 0,
+        "tokens": {"input": 0, "cached": 0, "output": 0, "reasoning": 0, "total": 0},
+        "repos": Counter(),
+        "languages": Counter(),
+        "efforts": Counter(),
+        "model_usage": Counter(),
+        "model_tokens": defaultdict(lambda: {"input": 0, "cached": 0, "output": 0, "total": 0}),
+        "days": defaultdict(lambda: {"active_seconds": 0, "session_count": 0}),
+    }
+    for session in sessions:
+        data["active_seconds"] += session["active_seconds"]
+        data["session_count"] += 1
+        for key in data["tokens"]:
+            data["tokens"][key] += session["tokens"].get(key, 0)
+        data["repos"][session["repo"]] += session["active_seconds"]
+        merge_counter(data["languages"], session["languages"])
+        merge_counter(data["efforts"], session.get("efforts", Counter()))
+        session_models = session.get("models", Counter())
+        if session_models:
+            for model_name, model_marks in session_models.items():
+                data["model_usage"][model_name] += model_marks
+                bucket = data["model_tokens"][model_name]
+                source_bucket = (session.get("model_tokens") or {}).get(model_name, {})
+                bucket["input"] += int(source_bucket.get("input", 0) or 0)
+                bucket["cached"] += int(source_bucket.get("cached", 0) or 0)
+                bucket["output"] += int(source_bucket.get("output", 0) or 0)
+                bucket["total"] += int(source_bucket.get("total", 0) or 0)
+        day_key = session["start"].date().isoformat()
+        data["days"][day_key]["active_seconds"] += session["active_seconds"]
+        data["days"][day_key]["session_count"] += 1
+    return data
+
+
+def sorted_top(counter, limit=5):
+    return sorted(counter.items(), key=lambda item: item[1], reverse=True)[:limit]
+
+
+def print_banner(scope_title: str, combined_stats):
+    print(color("╔══════════════════════════════════════════════════════════════════════╗", "96"))
+    print(color("║", "96") + " " + color("AGENT USAGE DASHBOARD", "1;96") + " " * 39 + color("║", "96"))
+    print(color("║", "96") + " " + dim(scope_title) + " " * max(1, 61 - len(scope_title)) + color("║", "96"))
+    print(color("╚══════════════════════════════════════════════════════════════════════╝", "96"))
+    print()
+    print(
+        f"  {color('ACTIVE', '1;93')} {color(human_seconds(combined_stats['active_seconds']), '1;97')}    "
+        f"{color('SESSIONS', '1;95')} {color(str(combined_stats['session_count']), '1;97')}    "
+        f"{color('TOKENS', '1;94')} {color(compact_tokens(combined_stats['tokens']['total']), '1;97')}"
+    )
+    print(f"  {dim('Legend:')} {color('Input', '95')} {dim('= input tokens,')} {color('Output', '93')} {dim('= output tokens,')} {color('Total', '95')} {dim('= total tokens.')}")
+    print(f"  {dim('Bar meaning: within each card, longer bars mean larger token buckets for that source and time range.')}")
+    print()
+
+
+def print_section(title, color_code, stats):
+    top_repos = [(name, human_seconds(int(seconds))) for name, seconds in sorted_top(stats["repos"], 4)]
+    top_langs = [(name, str(count)) for name, count in sorted_top(stats["languages"], 5)]
+    top_days = [
+        (day[5:], human_seconds(values["active_seconds"]))
+        for day, values in sorted(stats["days"].items(), key=lambda item: item[0], reverse=True)[:4]
+    ]
+    top_models = model_rows(stats, PRICING_MAP, 4)
+    top_efforts = usage_rows(stats["efforts"], 4)
+    token_total = max(stats["tokens"]["total"], 1)
+
+    print(color("┏" + "━" * 66 + "┓", color_code))
+    print(color("┃", color_code) + f" {color(title.upper(), '1;' + color_code)}" + " " * max(1, 65 - len(title)) + color("┃", color_code))
+    print(color("┣" + "━" * 66 + "┫", color_code))
+    print(metric_line("Active time", human_seconds(stats["active_seconds"]), "1;97"))
+    print(metric_line("Sessions", str(stats["session_count"]), "1;97"))
+    print()
+    print(f"  {color('Token intensity', color_code)}")
+    print(f"    {dim('Scaled against Total tokens in this card, so Total is always the 100% reference bar.')}")
+    print(f"    {dim('Input '.ljust(8))} {bar(stats['tokens']['input'], token_total, color_code=color_code)} {color(compact_tokens(stats['tokens']['input']), '97')}")
+    print(f"    {dim('Output'.ljust(8))} {bar(stats['tokens']['output'], token_total, color_code='93')} {color(compact_tokens(stats['tokens']['output']), '97')}")
+    print(f"    {dim('Total '.ljust(8))} {bar(stats['tokens']['total'], token_total, color_code='95')} {color(compact_tokens(stats['tokens']['total']), '1;97')}")
+    print()
+    for line in list_block("Top repos", top_repos, color_code):
+        print(line)
+    print()
+    for line in list_block("Languages", top_langs, "92"):
+        print(line)
+    print()
+    for line in glam_bar_list_block(
+        "Models",
+        top_models,
+        "96",
+        "1;96",
+        "◈",
+        "Usage share, per-model token split, and live models.dev rate card.",
+    ):
+        print(line)
+    print()
+    for line in glam_bar_list_block(
+        "Reasoning effort",
+        top_efforts,
+        "91",
+        "1;91",
+        "⬢",
+        "Share of turns by reasoning level in this source and range.",
+    ):
+        print(line)
+    print()
+    for line in list_block("Daily active", top_days, "93"):
+        print(line)
+    print(color("┗" + "━" * 66 + "┛", color_code))
+    print()
+
+
+all_sessions = collect_sessions()
+PRICING_MAP = load_pricing_map()
+start = scope_start(SCOPE)
+filtered = filter_sessions(all_sessions, start)
+codex_sessions = [s for s in filtered if s["source"] == "codex"]
+pi_sessions = [s for s in filtered if s["source"] == "pi"]
+combined = aggregate(filtered)
+codex = aggregate(codex_sessions)
+pi = aggregate(pi_sessions)
+
+scope_title = {
+    "today": f"Today · {TODAY.isoformat()}",
+    "7d": f"Last 7 Days · since {(TODAY - dt.timedelta(days=6)).isoformat()}",
+    "month": f"This Month · since {TODAY.replace(day=1).isoformat()}",
+}[SCOPE]
+
+print_banner(scope_title, combined)
+print_section("Combined", "95", combined)
+print_section("Codex", "94", codex)
+print_section("Pi", "92", pi)
+
+print(color("HIGHLIGHTS", "1;93"))
+if filtered:
+    longest = max(filtered, key=lambda s: s["active_seconds"])
+    print(
+        f"  {color('Longest active', '93')}  {bold(longest['source'])} {dim('·')} "
+        f"{color(human_seconds(longest['active_seconds']), '1;97')} {dim('·')} {color(longest['repo'], '96')}"
+    )
+    latest = max(filtered, key=lambda s: s["end"])
+    print(
+        f"  {color('Latest session', '95')}  {bold(latest['source'])} {dim('·')} "
+        f"{color(latest['end'].strftime('%b %d %I:%M %p'), '1;97')} {dim('·')} {color(latest['repo'], '96')}"
+    )
+else:
+    print(f"  {dim('No sessions found in this range.')}")
+PY
+}
+
+show_sources() {
+  gum style --foreground 212 --bold "Session stores found locally"
+  printf "\n"
+  gum style --foreground 99 "Codex" && printf "  ~/.codex/sessions and ~/.codex/history.jsonl\n"
+  gum style --foreground 86 "Pi" && printf "  ~/.pi/agent/sessions (resolved from your ~/.pi symlink)\n"
+  printf "\n"
+  gum style --faint "This dashboard reads local JSONL session history directly."
+}
+
+pick_scope() {
+  gum choose \
+    --header "Pick a time range" \
+    "today" \
+    "7d" \
+    "month"
+}
+
+scope="$(pick_scope)" || exit 0
+
+while true; do
+  clear
+  show_sources
+  printf "\n"
+  render_report "$scope"
+  printf "\n"
+  action="$(gum choose \
+    --header "Choose an action" \
+    "Change range" \
+    "Refresh" \
+    "Exit")" || exit 0
+
+  case "$action" in
+    "Change range")
+      scope="$(pick_scope)" || exit 0
+      ;;
+    "Refresh")
+      ;;
+    "Exit")
+      exit 0
+      ;;
+  esac
+done
