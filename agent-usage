@@ -13,9 +13,39 @@ fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
+usage() {
+  cat <<'EOF'
+Usage: agent-usage [--claude]
+
+Options:
+  --claude   Include Claude Code usage from ~/.claude/projects
+  -h, --help Show this help
+EOF
+}
+
+INCLUDE_CLAUDE=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --claude)
+      INCLUDE_CLAUDE=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
 render_report() {
   local scope="$1"
-  python3 - "$scope" <<'PY'
+  local include_claude="$2"
+  python3 - "$scope" "$include_claude" <<'PY'
 import datetime as dt
 import json
 import os
@@ -27,11 +57,13 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 SCOPE = sys.argv[1]
+INCLUDE_CLAUDE = sys.argv[2] == "1"
 HOME = Path.home()
 NOW = dt.datetime.now().astimezone()
 TODAY = NOW.date()
 
 CODEX_DIR = HOME / ".codex" / "sessions"
+CLAUDE_DIR = HOME / ".claude" / "projects"
 PI_LINK = HOME / ".pi"
 PI_HOME = PI_LINK.resolve() if PI_LINK.exists() else PI_LINK
 PI_DIR = PI_HOME / "agent" / "sessions"
@@ -80,6 +112,10 @@ MODEL_ALIASES = {
     "gpt-5.4": "openai/gpt-5.4",
     "gpt-5.4-mini": "openai/gpt-5.4-mini",
     "gpt-5.5": "openai/gpt-5.5",
+    "claude-sonnet-4-6": "anthropic/claude-sonnet-4.6",
+    "claude-opus-4-6": "anthropic/claude-opus-4.6",
+    "claude-opus-4-7": "anthropic/claude-opus-4.7",
+    "claude-haiku-4-5-20251001": "anthropic/claude-haiku-4.5",
     "deepseek-v4-flash-free": "deepseek/deepseek-v4-flash:free",
     "deepseek-v4-flash": "deepseek/deepseek-v4-flash",
 }
@@ -98,8 +134,8 @@ def scope_start(scope: str) -> dt.datetime:
     if scope == "7d":
         start_day = TODAY - dt.timedelta(days=6)
         return dt.datetime.combine(start_day, dt.time.min, NOW.tzinfo)
-    if scope == "month":
-        start_day = TODAY.replace(day=1)
+    if scope == "30d":
+        start_day = TODAY - dt.timedelta(days=29)
         return dt.datetime.combine(start_day, dt.time.min, NOW.tzinfo)
     raise ValueError(f"unknown scope: {scope}")
 
@@ -194,12 +230,15 @@ def codex_session_stats(path: Path):
                 info = info.get("total_token_usage") or {}
                 if not isinstance(info, dict):
                     info = {}
+                input_tokens = int(info.get("input_tokens", 0) or 0)
+                cached_tokens = int(info.get("cached_input_tokens", 0) or 0)
+                output_tokens = int(info.get("output_tokens", 0) or 0)
                 token_total = {
-                    "input": int(info.get("input_tokens", 0) or 0),
-                    "cached": int(info.get("cached_input_tokens", 0) or 0),
-                    "output": int(info.get("output_tokens", 0) or 0),
+                    "input": input_tokens,
+                    "cached": cached_tokens,
+                    "output": output_tokens,
                     "reasoning": int(info.get("reasoning_output_tokens", 0) or 0),
-                    "total": int(info.get("total_tokens", 0) or 0),
+                    "total": input_tokens + cached_tokens + output_tokens,
                 }
 
     if not events:
@@ -327,12 +366,111 @@ def pi_session_stats(path: Path):
     }
 
 
+def claude_session_stats(path: Path):
+    session_id = None
+    cwd = None
+    events: list[dt.datetime] = []
+    tokens = {"input": 0, "cached": 0, "output": 0, "reasoning": 0, "total": 0}
+    langs: Counter[str] = Counter()
+    model_counts: Counter[str] = Counter()
+    effort_counts: Counter[str] = Counter()
+    model_tokens: dict[str, dict[str, int]] = defaultdict(lambda: {"input": 0, "cached": 0, "output": 0, "total": 0})
+
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            langs.update(infer_languages(line))
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(item, dict):
+                continue
+            ts = parse_ts(item.get("timestamp", ""))
+            if ts:
+                events.append(ts)
+            session_id = session_id or item.get("sessionId")
+            cwd = cwd or item.get("cwd")
+
+            message = item.get("message") or {}
+            if not isinstance(message, dict):
+                message = {}
+
+            model_name = message.get("model")
+            if model_name and model_name != "<synthetic>":
+                model_counts[str(model_name)] += 1
+
+            usage = message.get("usage") or {}
+            if not isinstance(usage, dict):
+                usage = {}
+            if usage:
+                input_tokens = int(usage.get("input_tokens", 0) or 0)
+                cached_tokens = int(usage.get("cache_read_input_tokens", 0) or 0)
+                output_tokens = int(usage.get("output_tokens", 0) or 0)
+                reasoning_tokens = 0
+                iterations = usage.get("iterations")
+                if isinstance(iterations, list):
+                    for iteration in iterations:
+                        if not isinstance(iteration, dict):
+                            continue
+                        reasoning_tokens += int(iteration.get("output_tokens", 0) or 0)
+                total_tokens = int(
+                    usage.get("total_tokens", 0)
+                    or input_tokens + cached_tokens + output_tokens
+                )
+                tokens["input"] += input_tokens
+                tokens["cached"] += cached_tokens
+                tokens["output"] += output_tokens
+                tokens["reasoning"] += reasoning_tokens
+                tokens["total"] += total_tokens
+                if model_name and model_name != "<synthetic>":
+                    bucket = model_tokens[str(model_name)]
+                    bucket["input"] += input_tokens
+                    bucket["cached"] += cached_tokens
+                    bucket["output"] += output_tokens
+                    bucket["total"] += total_tokens
+
+    if not events:
+        return None
+    events.sort()
+    active = 0
+    for prev, cur in zip(events, events[1:]):
+        delta = int((cur - prev).total_seconds())
+        if delta > 0:
+            active += min(delta, ACTIVE_GAP_SECONDS)
+    if active == 0:
+        active = 60
+
+    return {
+        "source": "claude",
+        "session_id": session_id or path.stem,
+        "cwd": cwd,
+        "repo": repo_name(cwd),
+        "start": events[0],
+        "end": events[-1],
+        "active_seconds": active,
+        "tokens": tokens,
+        "languages": langs,
+        "models": model_counts,
+        "efforts": effort_counts,
+        "model_tokens": dict(model_tokens),
+        "path": str(path),
+    }
+
+
 def collect_sessions():
     sessions = []
     for path in iter_jsonl_files(CODEX_DIR):
         stat = codex_session_stats(path)
         if stat:
             sessions.append(stat)
+    if INCLUDE_CLAUDE:
+        for path in iter_jsonl_files(CLAUDE_DIR):
+            stat = claude_session_stats(path)
+            if stat:
+                sessions.append(stat)
     for path in iter_jsonl_files(PI_DIR):
         stat = pi_session_stats(path)
         if stat:
@@ -370,6 +508,16 @@ def dim(text: str) -> str:
 
 def bold(text: str) -> str:
     return color(text, "1")
+
+
+def visible_len(text: str) -> int:
+    return len(text)
+
+
+def framed_line(text: str, width: int, border_color: str, text_color: str | None = None) -> str:
+    shown = color(text, text_color) if text_color else text
+    padding = max(0, width - visible_len(text))
+    return color("║", border_color) + " " + shown + (" " * padding) + color("║", border_color)
 
 
 def bar(value: int, max_value: int, width: int = 22, color_code: str = "96") -> str:
@@ -512,13 +660,27 @@ def model_rows(stats: dict, pricing_map: dict, limit: int = 5) -> list[tuple[str
         pricing = pricing_map.get(model_id) or {}
         prompt_rate = usd_per_million(as_decimal(pricing.get("prompt")))
         completion_rate = usd_per_million(as_decimal(pricing.get("completion")))
+        costs = estimate_cost_breakdown_usd(model, token_info, pricing_map)
         rows.append((
             model,
             f"{pct:.0f}% · in {compact_tokens(token_info.get('input', 0))} ({prompt_rate})"
-            f" · out {compact_tokens(token_info.get('output', 0))} ({completion_rate})",
+            f" · out {compact_tokens(token_info.get('output', 0))} ({completion_rate})"
+            f" · est {usd(costs['total']) if costs else 'n/a'}",
             pct,
         ))
     return rows
+
+
+def estimate_stats_total_cost(stats: dict, pricing_map: dict) -> Decimal | None:
+    total_cost = Decimal("0")
+    found_any = False
+    for model_name, token_info in stats.get("model_tokens", {}).items():
+        costs = estimate_cost_breakdown_usd(model_name, token_info, pricing_map)
+        if not costs:
+            continue
+        total_cost += costs["total"]
+        found_any = True
+    return total_cost if found_any else None
 
 
 def glam_bar_list_block(title: str, rows: list[tuple[str, str, float]], accent: str, glow: str, badge: str, note: str | None = None) -> list[str]:
@@ -579,17 +741,25 @@ def sorted_top(counter, limit=5):
 
 
 def print_banner(scope_title: str, combined_stats):
-    print(color("╔══════════════════════════════════════════════════════════════════════╗", "96"))
-    print(color("║", "96") + " " + color("AGENT USAGE DASHBOARD", "1;96") + " " * 39 + color("║", "96"))
-    print(color("║", "96") + " " + dim(scope_title) + " " * max(1, 61 - len(scope_title)) + color("║", "96"))
-    print(color("╚══════════════════════════════════════════════════════════════════════╝", "96"))
+    combined_cost = estimate_stats_total_cost(combined_stats, PRICING_MAP)
+    inner_width = 66
+    print(color("╔" + "═" * inner_width + "╗", "96"))
+    print(framed_line("AGENT USAGE DASHBOARD", inner_width - 1, "96", "1;96"))
+    print(framed_line(scope_title, inner_width - 1, "96", "2"))
+    print(color("╚" + "═" * inner_width + "╝", "96"))
     print()
     print(
         f"  {color('ACTIVE', '1;93')} {color(human_seconds(combined_stats['active_seconds']), '1;97')}    "
         f"{color('SESSIONS', '1;95')} {color(str(combined_stats['session_count']), '1;97')}    "
-        f"{color('TOKENS', '1;94')} {color(compact_tokens(combined_stats['tokens']['total']), '1;97')}"
+        f"{color('TOKENS', '1;94')} {color(compact_tokens(combined_stats['tokens']['total']), '1;97')}    "
+        f"{color('COST', '1;92')} {color(usd(combined_cost), '1;97')}"
     )
-    print(f"  {dim('Legend:')} {color('Input', '95')} {dim('= input tokens,')} {color('Output', '93')} {dim('= output tokens,')} {color('Total', '95')} {dim('= total tokens.')}")
+    print(
+        f"  {dim('Legend:')} {color('Input', '95')} {dim('= input,')} "
+        f"{color('Cached', '96')} {dim('= cache reads,')} "
+        f"{color('Output', '93')} {dim('= output,')} "
+        f"{color('Total', '95')} {dim('= input + cached + output.')}"
+    )
     print(f"  {dim('Bar meaning: within each card, longer bars mean larger token buckets for that source and time range.')}")
     print()
 
@@ -604,16 +774,20 @@ def print_section(title, color_code, stats):
     top_models = model_rows(stats, PRICING_MAP, 4)
     top_efforts = usage_rows(stats["efforts"], 4)
     token_total = max(stats["tokens"]["total"], 1)
+    total_cost = estimate_stats_total_cost(stats, PRICING_MAP)
 
     print(color("┏" + "━" * 66 + "┓", color_code))
     print(color("┃", color_code) + f" {color(title.upper(), '1;' + color_code)}" + " " * max(1, 65 - len(title)) + color("┃", color_code))
     print(color("┣" + "━" * 66 + "┫", color_code))
     print(metric_line("Active time", human_seconds(stats["active_seconds"]), "1;97"))
     print(metric_line("Sessions", str(stats["session_count"]), "1;97"))
+    print(metric_line("Est cost", usd(total_cost), "1;92"))
     print()
     print(f"  {color('Token intensity', color_code)}")
-    print(f"    {dim('Scaled against Total tokens in this card, so Total is always the 100% reference bar.')}")
+    print(f"    {dim('Scaled against Total tokens in this card.')}")
+    print(f"    {dim('Total here means input + cached + output, so large cache usage will dominate it.')}")
     print(f"    {dim('Input '.ljust(8))} {bar(stats['tokens']['input'], token_total, color_code=color_code)} {color(compact_tokens(stats['tokens']['input']), '97')}")
+    print(f"    {dim('Cached'.ljust(8))} {bar(stats['tokens']['cached'], token_total, color_code='96')} {color(compact_tokens(stats['tokens']['cached']), '97')}")
     print(f"    {dim('Output'.ljust(8))} {bar(stats['tokens']['output'], token_total, color_code='93')} {color(compact_tokens(stats['tokens']['output']), '97')}")
     print(f"    {dim('Total '.ljust(8))} {bar(stats['tokens']['total'], token_total, color_code='95')} {color(compact_tokens(stats['tokens']['total']), '1;97')}")
     print()
@@ -654,20 +828,24 @@ PRICING_MAP = load_pricing_map()
 start = scope_start(SCOPE)
 filtered = filter_sessions(all_sessions, start)
 codex_sessions = [s for s in filtered if s["source"] == "codex"]
+claude_sessions = [s for s in filtered if s["source"] == "claude"]
 pi_sessions = [s for s in filtered if s["source"] == "pi"]
 combined = aggregate(filtered)
 codex = aggregate(codex_sessions)
+claude = aggregate(claude_sessions)
 pi = aggregate(pi_sessions)
 
 scope_title = {
     "today": f"Today · {TODAY.isoformat()}",
     "7d": f"Last 7 Days · since {(TODAY - dt.timedelta(days=6)).isoformat()}",
-    "month": f"This Month · since {TODAY.replace(day=1).isoformat()}",
+    "30d": f"Last 30 Days (rolling) · since {(TODAY - dt.timedelta(days=29)).isoformat()}",
 }[SCOPE]
 
 print_banner(scope_title, combined)
 print_section("Combined", "95", combined)
 print_section("Codex", "94", codex)
+if INCLUDE_CLAUDE:
+    print_section("Claude Code", "35", claude)
 print_section("Pi", "92", pi)
 
 print(color("HIGHLIGHTS", "1;93"))
@@ -688,9 +866,13 @@ PY
 }
 
 show_sources() {
+  local include_claude="$1"
   gum style --foreground 212 --bold "Session stores found locally"
   printf "\n"
   gum style --foreground 99 "Codex" && printf "  ~/.codex/sessions and ~/.codex/history.jsonl\n"
+  if [[ "$include_claude" == "1" ]]; then
+    gum style --foreground 35 "Claude Code" && printf "  ~/.claude/projects\n"
+  fi
   gum style --foreground 86 "Pi" && printf "  ~/.pi/agent/sessions (resolved from your ~/.pi symlink)\n"
   printf "\n"
   gum style --faint "This dashboard reads local JSONL session history directly."
@@ -698,19 +880,19 @@ show_sources() {
 
 pick_scope() {
   gum choose \
-    --header "Pick a time range" \
+    --header "Pick a time range (explicitly rolling for 7d and 30d)" \
     "today" \
     "7d" \
-    "month"
+    "30d"
 }
 
 scope="$(pick_scope)" || exit 0
 
 while true; do
   clear
-  show_sources
+  show_sources "$INCLUDE_CLAUDE"
   printf "\n"
-  render_report "$scope"
+  render_report "$scope" "$INCLUDE_CLAUDE"
   printf "\n"
   action="$(gum choose \
     --header "Choose an action" \
