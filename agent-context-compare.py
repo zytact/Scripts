@@ -213,7 +213,7 @@ def classify_tool(tool_name: str, text: str = "") -> set[str]:
         tags.add("search")
     if t in {"edit", "write"}:
         tags.add("edit_diff")
-    if t == "bash":
+    if t in {"bash", "exec_command", "shell", "shell_command", "run_shell_command"}:
         tags |= classify_command(text)
     return tags
 
@@ -556,9 +556,11 @@ class CodexParser(BaseParser):
                     info = payload.get("info") if isinstance(payload.get("info"), dict) else None
                     total_usage = info.get("total_token_usage") if info and isinstance(info.get("total_token_usage"), dict) else None
                     if total_usage:
+                        raw_input = int(total_usage.get("input_tokens") or 0)
+                        cached = int(total_usage.get("cached_input_tokens") or 0)
                         cur = {
-                            "input": int(total_usage.get("input_tokens") or 0),
-                            "cached": int(total_usage.get("cached_input_tokens") or 0),
+                            "input": max(0, raw_input - cached),
+                            "cached": cached,
                             "output": int(total_usage.get("output_tokens") or 0),
                             "reasoning": int(total_usage.get("reasoning_output_tokens") or 0),
                             "total": int(total_usage.get("total_tokens") or 0),
@@ -693,7 +695,7 @@ class PiParser(BaseParser):
                                 pending_tags |= classify_tool(name, command)
                         usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else None
                         if usage:
-                            fresh = int(usage.get("input") or 0)
+                            fresh = int(usage.get("input") or 0) + int(usage.get("cacheWrite") or 0)
                             turn_fresh_inputs.append(fresh)
                             if "file_read" in pending_tags:
                                 fresh_after_file_reads += fresh
@@ -714,14 +716,15 @@ class PiParser(BaseParser):
                                 u.total += t
                                 u.source_total = (u.source_total or 0) + t
                             else:
-                                t = int(usage.get("input") or 0) + int(usage.get("output") or 0) + int(usage.get("cacheRead") or 0)
+                                t = int(usage.get("input") or 0) + int(usage.get("output") or 0) + int(usage.get("cacheRead") or 0) + int(usage.get("cacheWrite") or 0)
                                 u.total += t
                                 u.source_total = (u.source_total or 0) + t
                             cost = msg.get("usage", {}).get("cost", {}).get("total")
                             if cost is not None:
                                 try:
                                     cd = Decimal(str(cost))
-                                    u.cost = (u.cost or Decimal("0")) + cd
+                                    if cd != 0:
+                                        u.cost = (u.cost or Decimal("0")) + cd
                                 except InvalidOperation:
                                     pass
                     elif role == "toolResult":
@@ -1172,9 +1175,26 @@ def css_pct(value: float | int | None, max_value: float | int | None) -> str:
     if value is None or max_value is None or max_value <= 0:
         return "0%"
     pct = max(0.0, min(100.0, (float(value) / float(max_value)) * 100))
-    if value and pct < 2:
+    if pct > 0 and pct < 2:
         pct = 2
     return f"{pct:.1f}%"
+
+
+def css_pair_pcts(left: float | int | None, right: float | int | None) -> tuple[str, str]:
+    lval = abs(float(left or 0))
+    rval = abs(float(right or 0))
+    total = lval + rval
+    if total <= 0:
+        return "0%", "0%"
+    lpct = (lval / total) * 100
+    rpct = 100 - lpct
+    if lval and lpct < 2:
+        lpct = 2
+        rpct = 98
+    if rval and rpct < 2:
+        rpct = 2
+        lpct = 98
+    return f"{lpct:.1f}%", f"{rpct:.1f}%"
 
 
 def compact_number(value: float | Decimal | None, digits: int = 2) -> str:
@@ -1232,7 +1252,7 @@ def result_class(metric: dict[str, Any], side: str) -> str:
 def html_metric_tile(title: str, metric: dict[str, Any]) -> str:
     winner = metric["winner"]
     winner_class = "tie" if winner == "tie" else winner.lower() if winner in {"Codex", "Pi"} else "na"
-    max_value = max(float(metric["codex"] or 0), float(metric["pi"] or 0), 1)
+    codex_width, pi_width = css_pair_pcts(metric["codex"], metric["pi"])
     direction = "lower wins" if metric["lower_is_better"] else "higher wins"
     codex_cls = result_class(metric, "Codex")
     pi_cls = result_class(metric, "Pi")
@@ -1241,8 +1261,8 @@ def html_metric_tile(title: str, metric: dict[str, Any]) -> str:
         <p>{h(title)}</p>
         <h3>{h(winner)}</h3>
         <div class="mini-race" aria-hidden="true">
-          <span class="{codex_cls}" style="width:{css_pct(metric['codex'], max_value)}"></span>
-          <i class="{pi_cls}" style="width:{css_pct(metric['pi'], max_value)}"></i>
+          <span class="{codex_cls}" style="width:{codex_width}"></span>
+          <i class="{pi_cls}" style="width:{pi_width}"></i>
         </div>
         <dl>
           <div class="{codex_cls}"><dt>Codex</dt><dd>{h(metric['codex_text'])}</dd></div>
@@ -1300,6 +1320,7 @@ def html_compare_table(codex_agg: Aggregate, pi_agg: Aggregate) -> tuple[str, li
         compare_metric("Fresh/hour", cm["fresh_input_per_active_hour"], pm["fresh_input_per_active_hour"], True),
         compare_metric("Cache ratio", cm["cache_ratio"], pm["cache_ratio"], False, "pct"),
         compare_metric("Cost/hour", cm["cost_per_active_hour"], pm["cost_per_active_hour"], True, "cost"),
+        compare_metric("Cached/hour", cm["cached_input_per_active_hour"], pm["cached_input_per_active_hour"], False),
         compare_metric("Fresh/session", cm["fresh_input_per_session"], pm["fresh_input_per_session"], True),
         compare_metric("Cost/session", cm["cost_per_session"], pm["cost_per_session"], True, "cost"),
         compare_metric("Fresh/tool", cm["fresh_input_per_tool_call"], pm["fresh_input_per_tool_call"], True),
@@ -1308,7 +1329,7 @@ def html_compare_table(codex_agg: Aggregate, pi_agg: Aggregate) -> tuple[str, li
     ]
     body = []
     for row in rows:
-        max_value = max(float(row["codex"] or 0), float(row["pi"] or 0), 1)
+        codex_width, pi_width = css_pair_pcts(row["codex"], row["pi"])
         winner_class = "tie" if row["winner"] == "tie" else row["winner"].lower() if row["winner"] in {"Codex", "Pi"} else "na"
         codex_cls = result_class(row, "Codex")
         pi_cls = result_class(row, "Pi")
@@ -1319,7 +1340,7 @@ def html_compare_table(codex_agg: Aggregate, pi_agg: Aggregate) -> tuple[str, li
             <td class="{pi_cls}">{h(row['pi_text'])}</td>
             <td>{h(row['delta'])}</td>
             <td><b>{h(row['winner'])}</b></td>
-            <td><div class="split-bar"><span class="{codex_cls}" style="width:{css_pct(row['codex'], max_value)}"></span><i class="{pi_cls}" style="width:{css_pct(row['pi'], max_value)}"></i></div></td>
+            <td><div class="split-bar"><span class="{codex_cls}" style="width:{codex_width}"></span><i class="{pi_cls}" style="width:{pi_width}"></i></div></td>
           </tr>""")
     return f"""
       <section class="board-panel">
@@ -1337,12 +1358,14 @@ def html_probe_panel(codex_agg: Aggregate, pi_agg: Aggregate) -> str:
         ("After test logs", codex_agg.fresh_after_test_logs, pi_agg.fresh_after_test_logs),
         ("After edits/diffs", codex_agg.fresh_after_edits_diffs, pi_agg.fresh_after_edits_diffs),
     ]
-    max_value = max([v for _, cval, pval in items for v in (cval, pval)] + [1])
-    rows = "".join(f"""
+    rows = ""
+    for label, cval, pval in items:
+        c_width, p_width = css_pair_pcts(cval, pval)
+        rows += f"""
       <li>
         <div><span>{h(label)}</span><b>C {h(compact_int(cval))} · P {h(compact_int(pval))}</b></div>
-        <div class="dual-bar"><span style="width:{css_pct(cval, max_value)}"></span><i style="width:{css_pct(pval, max_value)}"></i></div>
-      </li>""" for label, cval, pval in items)
+        <div class="dual-bar"><span style="width:{c_width}"></span><i style="width:{p_width}"></i></div>
+      </li>"""
     largest = []
     for prefix, items_src in (("C file", codex_agg.largest_file_reads[:2]), ("P file", pi_agg.largest_file_reads[:2]), ("C search", codex_agg.largest_search_outputs[:2]), ("P search", pi_agg.largest_search_outputs[:2])):
         for size, label in items_src:
