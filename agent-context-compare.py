@@ -8,7 +8,10 @@ import math
 import os
 import re
 import sys
+import tempfile
 import urllib.request
+import webbrowser
+from html import escape
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -230,10 +233,12 @@ def growth_per_turn(values: list[int]) -> float | None:
 
 def compact_int(n: int) -> str:
     n = int(n)
+    if abs(n) >= 1_000_000_000:
+        return f"{n/1_000_000_000:.2f}B"
     if abs(n) >= 1_000_000:
         return f"{n/1_000_000:.2f}M"
     if abs(n) >= 1_000:
-        return f"{n/1_000:.1f}k"
+        return f"{n/1_000:.1f}K"
     return str(n)
 
 
@@ -1159,6 +1164,426 @@ def deserialize_aggregate(data: dict[str, Any]) -> Aggregate:
     return agg
 
 
+def h(value: Any) -> str:
+    return escape(str(value), quote=True)
+
+
+def css_pct(value: float | int | None, max_value: float | int | None) -> str:
+    if value is None or max_value is None or max_value <= 0:
+        return "0%"
+    pct = max(0.0, min(100.0, (float(value) / float(max_value)) * 100))
+    if value and pct < 2:
+        pct = 2
+    return f"{pct:.1f}%"
+
+
+def compact_number(value: float | Decimal | None, digits: int = 2) -> str:
+    if value is None:
+        return "n/a"
+    value = float(value)
+    sign = "-" if value < 0 else ""
+    n = abs(value)
+    for scale, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
+        if n >= scale:
+            shown = f"{n / scale:.{digits}f}".rstrip("0").rstrip(".")
+            return f"{sign}{shown}{suffix}"
+    return f"{value:.{digits}f}".rstrip("0").rstrip(".")
+
+
+def html_value(value: float | Decimal | None, kind: str = "number") -> str:
+    if kind == "pct":
+        return fmt_pct(value) if isinstance(value, float) or value is None else fmt_pct(float(value))
+    if kind == "cost":
+        return cost_str(value)
+    return compact_number(value)
+
+
+def compare_metric(label: str, codex_value: float | None, pi_value: float | None, lower_is_better: bool, kind: str = "number") -> dict[str, Any]:
+    winner = "n/a"
+    if codex_value is not None and pi_value is not None:
+        if math.isclose(float(codex_value), float(pi_value), rel_tol=1e-9, abs_tol=1e-9):
+            winner = "tie"
+        else:
+            winner = "Pi" if (pi_value < codex_value if lower_is_better else pi_value > codex_value) else "Codex"
+    return {
+        "label": label,
+        "codex": codex_value,
+        "pi": pi_value,
+        "codex_text": html_value(codex_value, kind),
+        "pi_text": html_value(pi_value, kind),
+        "delta": pct_diff(pi_value, codex_value),
+        "winner": winner,
+        "lower_is_better": lower_is_better,
+        "kind": kind,
+    }
+
+
+def result_class(metric: dict[str, Any], side: str) -> str:
+    winner = metric.get("winner")
+    if winner == "tie":
+        return "neutral"
+    if winner == side:
+        return "good"
+    if winner in {"Codex", "Pi"}:
+        return "bad"
+    return "neutral"
+
+
+def html_metric_tile(title: str, metric: dict[str, Any]) -> str:
+    winner = metric["winner"]
+    winner_class = "tie" if winner == "tie" else winner.lower() if winner in {"Codex", "Pi"} else "na"
+    max_value = max(float(metric["codex"] or 0), float(metric["pi"] or 0), 1)
+    direction = "lower wins" if metric["lower_is_better"] else "higher wins"
+    codex_cls = result_class(metric, "Codex")
+    pi_cls = result_class(metric, "Pi")
+    return f"""
+      <section class="verdict-card {winner_class}">
+        <p>{h(title)}</p>
+        <h3>{h(winner)}</h3>
+        <div class="mini-race" aria-hidden="true">
+          <span class="{codex_cls}" style="width:{css_pct(metric['codex'], max_value)}"></span>
+          <i class="{pi_cls}" style="width:{css_pct(metric['pi'], max_value)}"></i>
+        </div>
+        <dl>
+          <div class="{codex_cls}"><dt>Codex</dt><dd>{h(metric['codex_text'])}</dd></div>
+          <div class="{pi_cls}"><dt>Pi</dt><dd>{h(metric['pi_text'])}</dd></div>
+          <div><dt>Pi vs Codex</dt><dd>{h(metric['delta'])}</dd></div>
+        </dl>
+        <small>{h(direction)}</small>
+      </section>"""
+
+
+def token_stack(agg: Aggregate) -> str:
+    total = max(agg.usage.total, 1)
+    return f"""
+      <div class="token-stack" aria-label="Token mix">
+        <span class="fresh" style="width:{css_pct(agg.usage.fresh_input, total)}" title="Fresh input {h(compact_int(agg.usage.fresh_input))}"></span>
+        <span class="cached" style="width:{css_pct(agg.usage.cached_input, total)}" title="Cached input {h(compact_int(agg.usage.cached_input))}"></span>
+        <span class="output" style="width:{css_pct(agg.usage.output, total)}" title="Output {h(compact_int(agg.usage.output))}"></span>
+      </div>"""
+
+
+def html_agent_panel(name: str, agg: Aggregate) -> str:
+    m = metrics(agg)
+    cls = name.lower()
+    return f"""
+      <section class="agent-panel {cls}">
+        <header>
+          <p>{h(name)}</p>
+          <h2>{h(fmt_hours(agg.active_seconds))}</h2>
+          <span>{h(str(agg.session_count))} sessions</span>
+        </header>
+        {token_stack(agg)}
+        <dl class="agent-kpis">
+          <div><dt>Fresh/hour</dt><dd>{h(html_value(m['fresh_input_per_active_hour']))}</dd></div>
+          <div><dt>Cache ratio</dt><dd>{h(fmt_pct(m['cache_ratio']))}</dd></div>
+          <div><dt>Cost/hour</dt><dd>{h(cost_str(m['cost_per_active_hour']))}</dd></div>
+          <div><dt>Fresh/session</dt><dd>{h(html_value(m['fresh_input_per_session']))}</dd></div>
+          <div><dt>Fresh/tool</dt><dd>{h(html_value(m['fresh_input_per_tool_call']))}</dd></div>
+          <div><dt>Ctx Δ/turn</dt><dd>{h(html_value(m['context_growth_per_turn']))}</dd></div>
+        </dl>
+        <dl class="token-ledger">
+          <div><dt>Fresh</dt><dd>{h(compact_int(agg.usage.fresh_input))}</dd></div>
+          <div><dt>Cached</dt><dd>{h(compact_int(agg.usage.cached_input))}</dd></div>
+          <div><dt>Output</dt><dd>{h(compact_int(agg.usage.output))}</dd></div>
+          <div><dt>Total</dt><dd>{h(compact_int(agg.usage.total))}</dd></div>
+          <div><dt>Cost</dt><dd>{h(cost_str(agg.usage.cost))}</dd></div>
+          <div><dt>Tools</dt><dd>{h(str(agg.tool_call_count))}</dd></div>
+        </dl>
+      </section>"""
+
+
+def html_compare_table(codex_agg: Aggregate, pi_agg: Aggregate) -> tuple[str, list[dict[str, Any]]]:
+    cm = metrics(codex_agg)
+    pm = metrics(pi_agg)
+    rows = [
+        compare_metric("Fresh/hour", cm["fresh_input_per_active_hour"], pm["fresh_input_per_active_hour"], True),
+        compare_metric("Cache ratio", cm["cache_ratio"], pm["cache_ratio"], False, "pct"),
+        compare_metric("Cost/hour", cm["cost_per_active_hour"], pm["cost_per_active_hour"], True, "cost"),
+        compare_metric("Fresh/session", cm["fresh_input_per_session"], pm["fresh_input_per_session"], True),
+        compare_metric("Cost/session", cm["cost_per_session"], pm["cost_per_session"], True, "cost"),
+        compare_metric("Fresh/tool", cm["fresh_input_per_tool_call"], pm["fresh_input_per_tool_call"], True),
+        compare_metric("Ctx Δ/turn", cm["context_growth_per_turn"], pm["context_growth_per_turn"], True),
+        compare_metric("Output/hour", cm["output_per_active_hour"], pm["output_per_active_hour"], False),
+    ]
+    body = []
+    for row in rows:
+        max_value = max(float(row["codex"] or 0), float(row["pi"] or 0), 1)
+        winner_class = "tie" if row["winner"] == "tie" else row["winner"].lower() if row["winner"] in {"Codex", "Pi"} else "na"
+        codex_cls = result_class(row, "Codex")
+        pi_cls = result_class(row, "Pi")
+        body.append(f"""
+          <tr class="winner-{winner_class}">
+            <th>{h(row['label'])}</th>
+            <td class="{codex_cls}">{h(row['codex_text'])}</td>
+            <td class="{pi_cls}">{h(row['pi_text'])}</td>
+            <td>{h(row['delta'])}</td>
+            <td><b>{h(row['winner'])}</b></td>
+            <td><div class="split-bar"><span class="{codex_cls}" style="width:{css_pct(row['codex'], max_value)}"></span><i class="{pi_cls}" style="width:{css_pct(row['pi'], max_value)}"></i></div></td>
+          </tr>""")
+    return f"""
+      <section class="board-panel">
+        <header><h2>Winner board</h2><p>Each row uses the metric's natural direction: lower context/cost wins, higher cache/output wins.</p></header>
+        <table>
+          <thead><tr><th>Metric</th><th>Codex</th><th>Pi</th><th>Pi vs Codex</th><th>Winner</th><th>Scale</th></tr></thead>
+          <tbody>{''.join(body)}</tbody>
+        </table>
+      </section>""", rows
+
+
+def html_probe_panel(codex_agg: Aggregate, pi_agg: Aggregate) -> str:
+    items = [
+        ("After file reads", codex_agg.fresh_after_file_reads, pi_agg.fresh_after_file_reads),
+        ("After test logs", codex_agg.fresh_after_test_logs, pi_agg.fresh_after_test_logs),
+        ("After edits/diffs", codex_agg.fresh_after_edits_diffs, pi_agg.fresh_after_edits_diffs),
+    ]
+    max_value = max([v for _, cval, pval in items for v in (cval, pval)] + [1])
+    rows = "".join(f"""
+      <li>
+        <div><span>{h(label)}</span><b>C {h(compact_int(cval))} · P {h(compact_int(pval))}</b></div>
+        <div class="dual-bar"><span style="width:{css_pct(cval, max_value)}"></span><i style="width:{css_pct(pval, max_value)}"></i></div>
+      </li>""" for label, cval, pval in items)
+    largest = []
+    for prefix, items_src in (("C file", codex_agg.largest_file_reads[:2]), ("P file", pi_agg.largest_file_reads[:2]), ("C search", codex_agg.largest_search_outputs[:2]), ("P search", pi_agg.largest_search_outputs[:2])):
+        for size, label in items_src:
+            largest.append(f"<li><b>{h(prefix)}</b><span>{h(compact_int(size))}</span><em title=\"{h(label)}\">{h(label[:90])}</em></li>")
+    largest_html = "".join(largest) if largest else '<li class="empty">No large reads/searches detected</li>'
+    return f"""
+      <section class="probe-panel">
+        <header><h2>Context waste probes</h2><p>Where fresh input spikes after high-context operations.</p></header>
+        <ul class="probe-bars">{rows}</ul>
+        <h3>Largest context injectors</h3>
+        <ul class="injector-list">{largest_html}</ul>
+      </section>"""
+
+
+def html_model_panel(model: str, codex_agg: Aggregate, pi_agg: Aggregate) -> str:
+    table, rows = html_compare_table(codex_agg, pi_agg)
+    cm = metrics(codex_agg)
+    pm = metrics(pi_agg)
+    lead = compare_metric("Fresh/hour", cm["fresh_input_per_active_hour"], pm["fresh_input_per_active_hour"], True)
+    return f"""
+      <article class="model-card">
+        <header><h3>{h(model)}</h3><span>{h(lead['winner'])} wins fresh/hour</span></header>
+        <div class="model-duo">
+          <div><b>Codex</b><span>{h(html_value(cm['fresh_input_per_active_hour']))}/h</span></div>
+          <div><b>Pi</b><span>{h(html_value(pm['fresh_input_per_active_hour']))}/h</span></div>
+        </div>
+        <div class="model-strip"><span style="width:{css_pct(codex_agg.usage.total, max(codex_agg.usage.total, pi_agg.usage.total, 1))}"></span><i style="width:{css_pct(pi_agg.usage.total, max(codex_agg.usage.total, pi_agg.usage.total, 1))}"></i></div>
+        <dl>
+          <div><dt>Cache C→P</dt><dd>{h(fmt_pct(cm['cache_ratio']))} → {h(fmt_pct(pm['cache_ratio']))}</dd></div>
+          <div><dt>Cost/hr C→P</dt><dd>{h(cost_str(cm['cost_per_active_hour']))} → {h(cost_str(pm['cost_per_active_hour']))}</dd></div>
+          <div><dt>Sessions C/P</dt><dd>{h(codex_agg.session_count)} / {h(pi_agg.session_count)}</dd></div>
+        </dl>
+      </article>"""
+
+
+def html_repo_slices(codex_filtered: list[SessionRecord], pi_filtered: list[SessionRecord], model_filter: set[str], repo: str | None) -> str:
+    repos = sorted(set(s.repo for s in codex_filtered) & set(s.repo for s in pi_filtered)) if not repo else [repo]
+    rows = []
+    for r in repos[:12]:
+        ca = aggregate_sessions(codex_filtered, model_filter, r)
+        pa = aggregate_sessions(pi_filtered, model_filter, r)
+        if ca.session_count == 0 or pa.session_count == 0:
+            continue
+        cmr = metrics(ca)
+        pmr = metrics(pa)
+        max_fresh = max(float(cmr["fresh_input_per_active_hour"] or 0), float(pmr["fresh_input_per_active_hour"] or 0), 1)
+        rows.append(f"""
+          <li>
+            <span title="{h(r)}">{h(r)}</span>
+            <b>C {h(html_value(cmr['fresh_input_per_active_hour']))}/h</b>
+            <b>P {h(html_value(pmr['fresh_input_per_active_hour']))}/h</b>
+            <div class="split-bar"><span style="width:{css_pct(cmr['fresh_input_per_active_hour'], max_fresh)}"></span><i style="width:{css_pct(pmr['fresh_input_per_active_hour'], max_fresh)}"></i></div>
+          </li>""")
+    body = "".join(rows) if rows else '<li class="empty">No overlapping repos after filters</li>'
+    return f"""
+      <section class="repo-panel">
+        <header><h2>Repo slices</h2><p>Fresh input per active hour by overlapping repo.</p></header>
+        <ul>{body}</ul>
+      </section>"""
+
+
+def render_compare_html(
+    repo: str | None,
+    model_filter: set[str],
+    codex_window: tuple[dt.datetime, dt.datetime] | None,
+    pi_window: tuple[dt.datetime, dt.datetime] | None,
+    baseline_payload: dict[str, Any] | None,
+    codex_agg: Aggregate,
+    pi_agg: Aggregate,
+    codex_by_model: dict[str, Aggregate],
+    pi_by_model: dict[str, Aggregate],
+    matched_models: list[str],
+    fairness: list[str],
+    codex_filtered: list[SessionRecord],
+    pi_filtered: list[SessionRecord],
+) -> str:
+    board_html, rows = html_compare_table(codex_agg, pi_agg)
+    lead_tiles = "".join([
+        html_metric_tile("Less fresh input/hour", rows[0]),
+        html_metric_tile("Better cache ratio", rows[1]),
+        html_metric_tile("Lower cost/hour", rows[2]),
+    ])
+    model_cards = "".join(html_model_panel(m, codex_by_model[m], pi_by_model[m]) for m in matched_models) or '<p class="empty-panel">No matching GPT models found in selected windows.</p>'
+    warnings = "".join(f"<li>{h(w)}</li>" for w in fairness) if fairness else "<li class=\"ok\">No caution flags.</li>"
+    generated = dt.datetime.now().astimezone().strftime("%b %d, %Y · %I:%M %p")
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPT Context Efficiency · Codex vs Pi</title>
+<style>
+:root {{
+  color-scheme: dark;
+  --bg: oklch(0.075 0 0);
+  --surface: oklch(0.135 0.010 258);
+  --surface-2: oklch(0.175 0.014 258);
+  --line: oklch(0.285 0.020 258);
+  --ink: oklch(0.940 0.010 258);
+  --muted: oklch(0.720 0.018 258);
+  --soft: oklch(0.560 0.030 258);
+  --codex: oklch(0.681 0.132 258.4);
+  --pi: oklch(0.740 0.140 150);
+  --warn: oklch(0.760 0.150 70);
+  --good: oklch(0.760 0.150 150);
+  --bad: oklch(0.680 0.180 28);
+  --fresh: oklch(0.690 0.130 300);
+  --cached: oklch(0.760 0.115 205);
+  --output: oklch(0.780 0.145 82);
+}}
+* {{ box-sizing: border-box; }}
+body {{ margin:0; background: radial-gradient(circle at 78% -10%, oklch(0.23 0.07 258 / .50), transparent 34rem), var(--bg); color: var(--ink); font: 500 15px/1.55 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+.shell {{ width:min(1320px, calc(100% - 32px)); margin:0 auto; padding:34px 0 58px; }}
+.hero {{ display:grid; grid-template-columns:minmax(0,1fr) 360px; gap:1px; background:var(--line); border:1px solid var(--line); }}
+.hero > div, .setup-card {{ background:linear-gradient(135deg, oklch(0.155 0.018 258), oklch(0.105 0.006 258)); padding:30px; }}
+.kicker {{ margin:0 0 10px; color:var(--warn); font-size:.78rem; font-weight:850; letter-spacing:.08em; text-transform:uppercase; }}
+h1 {{ margin:0; font-size:2.65rem; line-height:1.03; letter-spacing:-.025em; text-wrap:balance; }}
+.hero p {{ max-width:74ch; color:var(--muted); }}
+.setup-card dl {{ margin:0; display:grid; gap:10px; }}
+.setup-card div {{ min-width:0; }}
+dt {{ color:var(--soft); font-size:.76rem; }}
+dd {{ margin:2px 0 0; color:var(--ink); font-weight:800; font-variant-numeric:tabular-nums; overflow:hidden; text-overflow:ellipsis; }}
+.verdict-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:1px; margin-top:24px; background:var(--line); border:1px solid var(--line); }}
+.verdict-card {{ padding:22px; background:var(--surface); }}
+.verdict-card p {{ margin:0; color:var(--muted); }}
+.verdict-card h3 {{ margin:4px 0 14px; font-size:2rem; letter-spacing:-.02em; }}
+.verdict-card.pi h3, .verdict-card.codex h3 {{ color:var(--good); }} .verdict-card.tie h3 {{ color:var(--warn); }}
+.mini-race, .split-bar, .dual-bar, .model-strip, .token-stack {{ display:flex; gap:3px; align-items:stretch; background:oklch(0.245 0.018 258); overflow:hidden; }}
+.mini-race {{ height:10px; margin-bottom:14px; }}
+.mini-race span, .split-bar span, .dual-bar span, .model-strip span {{ background:var(--codex); }}
+.mini-race i, .split-bar i, .dual-bar i, .model-strip i {{ background:var(--pi); }}
+.good, td.good, .good dd {{ color:var(--good); }}
+.bad, td.bad, .bad dd {{ color:var(--bad); }}
+.neutral, td.neutral, .neutral dd {{ color:var(--muted); }}
+.mini-race .good, .split-bar .good {{ background:var(--good); }}
+.mini-race .bad, .split-bar .bad {{ background:var(--bad); }}
+.verdict-card dl {{ display:grid; grid-template-columns:repeat(3,1fr); gap:1px; margin:0; background:var(--line); }}
+.verdict-card dl div, .agent-kpis div, .token-ledger div, .model-card dl div {{ background:oklch(0.145 0.010 258); padding:10px; min-width:0; }}
+.verdict-card small {{ display:block; margin-top:10px; color:var(--soft); }}
+.agent-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:1px; margin-top:24px; background:var(--line); border:1px solid var(--line); }}
+.agent-panel {{ padding:24px; background:var(--surface); }}
+.agent-panel header {{ display:flex; justify-content:space-between; gap:18px; align-items:start; margin-bottom:18px; }}
+.agent-panel header p {{ margin:0; color:var(--muted); font-weight:800; }}
+.agent-panel h2 {{ margin:0; font-size:2.2rem; letter-spacing:-.025em; }}
+.agent-panel header span {{ color:var(--soft); }}
+.token-stack {{ height:18px; margin-bottom:18px; }}
+.token-stack .fresh {{ background:var(--fresh); }} .token-stack .cached {{ background:var(--cached); }} .token-stack .output {{ background:var(--output); }}
+.agent-kpis, .token-ledger {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:1px; margin:0 0 1px; background:var(--line); }}
+.token-ledger {{ grid-template-columns:repeat(6,minmax(0,1fr)); }}
+.board-panel, .probe-panel, .model-section, .repo-panel, .warnings-panel {{ margin-top:24px; border:1px solid var(--line); background:var(--surface); }}
+.board-panel header, .probe-panel header, .model-section header, .repo-panel header, .warnings-panel header {{ padding:20px 22px; border-bottom:1px solid var(--line); }}
+h2, h3 {{ margin:0; }}
+.board-panel p, .probe-panel p, .repo-panel p {{ margin:5px 0 0; color:var(--muted); }}
+table {{ width:100%; border-collapse:collapse; }}
+th, td {{ padding:12px 14px; border-top:1px solid var(--line); text-align:left; vertical-align:middle; font-variant-numeric:tabular-nums; }}
+thead th {{ color:var(--soft); font-size:.78rem; border-top:0; }}
+tbody th {{ color:var(--ink); }}
+td {{ color:var(--muted); }}
+td b {{ color:var(--ink); }}
+.winner-pi td b, .winner-codex td b {{ color:var(--good); }}
+.winner-tie td b {{ color:var(--warn); }}
+.split-bar {{ width:100%; min-width:120px; height:9px; }}
+.probe-bars, .injector-list, .repo-panel ul, .warnings-panel ul {{ list-style:none; padding:0; margin:0; }}
+.probe-bars li {{ padding:14px 22px; border-top:1px solid var(--line); }}
+.probe-bars li:first-child {{ border-top:0; }}
+.probe-bars div:first-child {{ display:flex; justify-content:space-between; gap:18px; margin-bottom:8px; }}
+.probe-bars span {{ color:var(--muted); }}
+.dual-bar {{ height:10px; }}
+.probe-panel h3 {{ padding:18px 22px 8px; font-size:1rem; }}
+.injector-list li, .repo-panel li, .warnings-panel li {{ display:grid; grid-template-columns:90px 90px minmax(0,1fr); gap:12px; padding:10px 22px; border-top:1px solid var(--line); }}
+.injector-list em, .repo-panel span {{ color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-style:normal; }}
+.model-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:1px; background:var(--line); }}
+.model-card {{ padding:18px; background:var(--surface-2); }}
+.model-card header {{ display:flex; justify-content:space-between; gap:14px; margin-bottom:14px; padding:0; border:0; }}
+.model-card header span {{ color:var(--muted); white-space:nowrap; }}
+.model-duo {{ display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--line); }}
+.model-duo div {{ padding:12px; background:oklch(0.145 0.010 258); }}
+.model-duo span {{ display:block; color:var(--muted); }}
+.model-strip {{ height:8px; margin:12px 0; }}
+.model-card dl {{ display:grid; grid-template-columns:1fr; gap:1px; margin:0; background:var(--line); }}
+.repo-panel li {{ grid-template-columns:minmax(0,1fr) 120px 120px 180px; }}
+.warnings-panel li {{ grid-template-columns:1fr; color:var(--warn); }}
+.warnings-panel li.ok {{ color:var(--pi); }}
+.empty, .empty-panel {{ color:var(--soft); padding:18px 22px; }}
+.legend {{ display:flex; gap:14px; flex-wrap:wrap; margin-top:12px; color:var(--muted); }}
+.legend i {{ display:inline-block; width:10px; height:10px; margin-right:6px; }}
+@media (max-width: 980px) {{ .hero, .agent-grid {{ grid-template-columns:1fr; }} .verdict-grid {{ grid-template-columns:1fr; }} .token-ledger {{ grid-template-columns:repeat(3,1fr); }} }}
+@media (max-width: 680px) {{ .shell {{ width:min(100% - 20px, 1320px); padding-top:10px; }} h1 {{ font-size:2rem; }} .agent-kpis, .token-ledger, .verdict-card dl {{ grid-template-columns:1fr; }} th,td {{ padding:10px 8px; }} .repo-panel li, .injector-list li {{ grid-template-columns:1fr; }} }}
+</style>
+</head>
+<body>
+<main class="shell">
+  <header class="hero">
+    <div>
+      <p class="kicker">GPT context efficiency</p>
+      <h1>Codex vs Pi comparison</h1>
+      <p>Glanceable view of context load, cache behavior, cost, and waste probes across matching GPT models.</p>
+      <div class="legend"><span><i style="background:var(--codex)"></i>Codex</span><span><i style="background:var(--pi)"></i>Pi</span><span><i style="background:var(--fresh)"></i>Fresh</span><span><i style="background:var(--cached)"></i>Cached</span><span><i style="background:var(--output)"></i>Output</span></div>
+    </div>
+    <aside class="setup-card">
+      <dl>
+        <div><dt>Repo filter</dt><dd>{h(repo or 'none')}</dd></div>
+        <div><dt>Matching models</dt><dd title="{h(', '.join(sorted(model_filter)))}">{h(', '.join(sorted(model_filter)) if model_filter else 'none')}</dd></div>
+        <div><dt>Codex window</dt><dd>{h(window_label(codex_window, baseline_payload))}</dd></div>
+        <div><dt>Pi window</dt><dd>{h(window_label(pi_window))}</dd></div>
+        <div><dt>Generated</dt><dd>{h(generated)}</dd></div>
+      </dl>
+    </aside>
+  </header>
+  <section class="verdict-grid">{lead_tiles}</section>
+  <section class="agent-grid">{html_agent_panel('Codex', codex_agg)}{html_agent_panel('Pi', pi_agg)}</section>
+  {board_html}
+  {html_probe_panel(codex_agg, pi_agg)}
+  <section class="model-section"><header><h2>Per matching model</h2></header><div class="model-grid">{model_cards}</div></section>
+  {html_repo_slices(codex_filtered, pi_filtered, model_filter, repo)}
+  <section class="warnings-panel"><header><h2>Fairness warnings</h2></header><ul>{warnings}</ul></section>
+</main>
+</body>
+</html>
+"""
+
+
+def write_or_open_html(doc: str, html_arg: str | None) -> None:
+    if html_arg == "-":
+        print(doc)
+        return
+    if html_arg:
+        path = Path(html_arg).expanduser()
+        should_open = False
+    else:
+        fd, tmp = tempfile.mkstemp(prefix="agent-context-compare-", suffix=".html")
+        os.close(fd)
+        path = Path(tmp)
+        should_open = True
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(doc, encoding="utf-8")
+    print(f"HTML report: {path}")
+    if should_open:
+        webbrowser.open(path.as_uri())
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Compare Pi vs Codex context efficiency on matching GPT models.")
     sub = p.add_subparsers(dest="cmd", required=False)
@@ -1179,6 +1604,7 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--codex-last-active-days", type=int)
     compare.add_argument("--pi-last-active-days", type=int)
     compare.add_argument("--json", action="store_true")
+    compare.add_argument("--html", nargs="?", const="", metavar="FILE", help="write a standalone HTML report. Omit FILE to open a temp report. Use --html=- for stdout")
     compare.add_argument("--baseline", help="saved Codex baseline JSON to compare against Pi")
 
     baseline = sub.add_parser("save-baseline", parents=[common])
@@ -1195,9 +1621,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     parser = build_parser()
-    args = parser.parse_args()
-    if not args.cmd:
-        args = parser.parse_args(["compare", *sys.argv[1:]])
+    argv = sys.argv[1:]
+    if argv and argv[0] in {"compare", "save-baseline", "debug-schema"}:
+        args = parser.parse_args(argv)
+    else:
+        args = parser.parse_args(["compare", *argv])
 
     codex_root = Path(args.codex_root).expanduser().resolve()
     pi_root = Path(args.pi_root).expanduser().resolve()
@@ -1265,6 +1693,25 @@ def main() -> int:
             "matched_models": matched_models,
             "fairness_warnings": fairness,
         }, indent=2))
+        return 0
+
+    if getattr(args, "html", None) is not None:
+        doc = render_compare_html(
+            repo,
+            model_filter,
+            codex_window,
+            pi_window,
+            baseline_payload,
+            codex_agg,
+            pi_agg,
+            codex_by_model,
+            pi_by_model,
+            matched_models,
+            fairness,
+            codex_filtered,
+            pi_filtered,
+        )
+        write_or_open_html(doc, args.html)
         return 0
 
     title = c("GPT Context Efficiency: Codex vs Pi", "bold", "white")

@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if ! command -v gum >/dev/null 2>&1; then
-  echo "Missing gum. Install it first."
-  exit 1
-fi
-
 if ! command -v python3 >/dev/null 2>&1; then
   echo "Missing python3."
   exit 1
@@ -15,19 +10,51 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
   cat <<'EOF'
-Usage: agent-usage [--claude]
+Usage: agent-usage [--claude] [--scope today|7d|30d] [--html [FILE]]
 
 Options:
-  --claude   Include Claude Code usage from ~/.claude/projects
-  -h, --help Show this help
+  --claude       Include Claude Code usage from ~/.claude/projects
+  --scope SCOPE  Use a range without prompting: today, 7d, 30d
+  --html [FILE]  Write a standalone HTML report. Omit FILE to open a temp report.
+                 Use --html=- to print HTML to stdout.
+  -h, --help     Show this help
 EOF
 }
 
 INCLUDE_CLAUDE=0
+SCOPE_ARG=""
+HTML_MODE=0
+HTML_PATH=""
+HTML_PATH_SET=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --claude)
       INCLUDE_CLAUDE=1
+      shift
+      ;;
+    --scope)
+      [[ $# -ge 2 ]] || { echo "Missing value for --scope" >&2; exit 1; }
+      SCOPE_ARG="$2"
+      shift 2
+      ;;
+    --scope=*)
+      SCOPE_ARG="${1#--scope=}"
+      shift
+      ;;
+    --html)
+      HTML_MODE=1
+      if [[ $# -ge 2 && "$2" != --* ]]; then
+        HTML_PATH="$2"
+        HTML_PATH_SET=1
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    --html=*)
+      HTML_MODE=1
+      HTML_PATH="${1#--html=}"
+      HTML_PATH_SET=1
       shift
       ;;
     -h|--help)
@@ -42,22 +69,39 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+case "$SCOPE_ARG" in
+  ""|today|7d|30d) ;;
+  *) echo "Invalid --scope: $SCOPE_ARG" >&2; usage >&2; exit 1 ;;
+esac
+
+if [[ "$HTML_MODE" == "0" || -z "$SCOPE_ARG" ]]; then
+  if ! command -v gum >/dev/null 2>&1; then
+    echo "Missing gum. Install it first."
+    exit 1
+  fi
+fi
+
 render_report() {
   local scope="$1"
   local include_claude="$2"
-  python3 - "$scope" "$include_claude" <<'PY'
+  local mode="${3:-terminal}"
+  local output_path="${4:-}"
+  python3 - "$scope" "$include_claude" "$mode" "$output_path" <<'PY'
 import datetime as dt
 import json
 import os
 import re
 import sys
 import urllib.request
+from html import escape
 from collections import Counter, defaultdict
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 SCOPE = sys.argv[1]
 INCLUDE_CLAUDE = sys.argv[2] == "1"
+OUTPUT_MODE = sys.argv[3]
+OUTPUT_PATH = sys.argv[4]
 HOME = Path.home()
 NOW = dt.datetime.now().astimezone()
 TODAY = NOW.date()
@@ -823,6 +867,363 @@ def print_section(title, color_code, stats):
     print()
 
 
+def h(value) -> str:
+    return escape(str(value), quote=True)
+
+
+def css_pct(value: int, max_value: int) -> str:
+    if max_value <= 0:
+        return "0%"
+    pct = max(0, min(100, (value / max_value) * 100))
+    if value > 0 and pct < 2:
+        pct = 2
+    return f"{pct:.1f}%"
+
+
+def slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "source"
+
+
+def html_metric(label: str, value: str, note: str = "") -> str:
+    note_html = f"<span>{h(note)}</span>" if note else ""
+    return f"""
+      <div class="metric">
+        <dt>{h(label)}</dt>
+        <dd>{h(value)}</dd>
+        {note_html}
+      </div>"""
+
+
+def html_token_bar(label: str, value: int, max_value: int, class_name: str) -> str:
+    return f"""
+      <div class="token-row {h(class_name)}">
+        <span>{h(label)}</span>
+        <div class="track" aria-hidden="true"><i style="width:{css_pct(value, max_value)}"></i></div>
+        <b>{h(compact_tokens(value))}</b>
+      </div>"""
+
+
+def html_simple_list(title: str, rows: list[tuple[str, str]], empty: str = "No data") -> str:
+    if not rows:
+        items = f"<li class=\"empty\">{h(empty)}</li>"
+    else:
+        items = "".join(f"<li><span>{h(name)}</span><b>{h(value)}</b></li>" for name, value in rows)
+    return f"""
+      <section class="mini-panel">
+        <h4>{h(title)}</h4>
+        <ul class="rank-list">{items}</ul>
+      </section>"""
+
+
+def html_share_list(title: str, rows: list[tuple[str, str, float]], empty: str = "No data") -> str:
+    if not rows:
+        body = f"<li class=\"empty\">{h(empty)}</li>"
+    else:
+        body = "".join(
+            f"""
+            <li>
+              <div class="share-head"><span>{h(name)}</span><b>{h(label)}</b></div>
+              <div class="track"><i style="width:{max(2, min(100, value)):.1f}%"></i></div>
+            </li>"""
+            for name, label, value in rows
+        )
+    return f"""
+      <section class="mini-panel wide">
+        <h4>{h(title)}</h4>
+        <ul class="share-list">{body}</ul>
+      </section>"""
+
+
+def html_models_panel(stats: dict, limit: int = 5) -> str:
+    total = sum(stats["model_usage"].values())
+    if total <= 0:
+        rows = '<li class="empty">No model markers</li>'
+    else:
+        parts = []
+        for model, count in sorted_top(stats["model_usage"], limit):
+            pct = (count / total) * 100
+            token_info = stats["model_tokens"].get(model, {})
+            model_id = MODEL_ALIASES.get(model, model)
+            pricing = PRICING_MAP.get(model_id) or {}
+            prompt_rate = usd_per_million(as_decimal(pricing.get("prompt")))
+            completion_rate = usd_per_million(as_decimal(pricing.get("completion")))
+            costs = estimate_cost_breakdown_usd(model, token_info, PRICING_MAP)
+            est_cost = usd(costs["total"]) if costs else "n/a"
+            parts.append(f"""
+            <li class="model-row">
+              <div class="model-top">
+                <span title="{h(model)}">{h(model)}</span>
+                <b>{pct:.0f}%</b>
+              </div>
+              <div class="track"><i style="width:{max(2, min(100, pct)):.1f}%"></i></div>
+              <dl class="model-metrics">
+                <div><dt>Input</dt><dd>{h(compact_tokens(token_info.get('input', 0)))}</dd><small>{h(prompt_rate)}</small></div>
+                <div><dt>Output</dt><dd>{h(compact_tokens(token_info.get('output', 0)))}</dd><small>{h(completion_rate)}</small></div>
+                <div><dt>Est cost</dt><dd>{h(est_cost)}</dd><small>range total</small></div>
+              </dl>
+            </li>""")
+        rows = "".join(parts)
+    return f"""
+      <section class="mini-panel wide model-panel">
+        <h4>Models</h4>
+        <ul class="model-list">{rows}</ul>
+      </section>"""
+
+
+def daily_strip(stats: dict, scope: str) -> str:
+    days = {"today": 1, "7d": 7, "30d": 30}[scope]
+    start_day = TODAY - dt.timedelta(days=days - 1)
+    values = []
+    for idx in range(days):
+        day = start_day + dt.timedelta(days=idx)
+        key = day.isoformat()
+        active = int(stats["days"].get(key, {}).get("active_seconds", 0))
+        values.append((day, active))
+    max_active = max((active for _, active in values), default=1) or 1
+    bars = "".join(
+        f"<span title=\"{h(day.isoformat() + ': ' + human_seconds(active))}\" "
+        f"style=\"height:{css_pct(active, max_active)}\"></span>"
+        for day, active in values
+    )
+    return f"""
+      <section class="activity-strip" aria-label="Daily active time">
+        <div><h3>Daily active trace</h3><p>Rolling range, scaled to the busiest day in this report.</p></div>
+        <div class="bars">{bars}</div>
+      </section>"""
+
+
+def html_source_section(title: str, stats: dict, tone: str) -> str:
+    top_repos = [(name, human_seconds(int(seconds))) for name, seconds in sorted_top(stats["repos"], 5)]
+    top_langs = [(name, str(count)) for name, count in sorted_top(stats["languages"], 5)]
+    top_days = [
+        (day[5:], human_seconds(values["active_seconds"]))
+        for day, values in sorted(stats["days"].items(), key=lambda item: item[0], reverse=True)[:5]
+    ]
+    efforts = usage_rows(stats["efforts"], 5)
+    token_total = max(stats["tokens"]["total"], 1)
+    total_cost = estimate_stats_total_cost(stats, PRICING_MAP)
+    source_slug = slug(title)
+    return f"""
+    <section class="source-block source-{source_slug}" style="--tone:{h(tone)}">
+      <header class="source-head">
+        <div>
+          <p class="source-label">{h(title)}</p>
+          <h2>{h(human_seconds(stats['active_seconds']))}</h2>
+        </div>
+        <dl>
+          {html_metric('Sessions', str(stats['session_count']))}
+          {html_metric('Tokens', compact_tokens(stats['tokens']['total']))}
+          {html_metric('Est cost', usd(total_cost))}
+        </dl>
+      </header>
+      <div class="token-panel" aria-label="Token intensity for {h(title)}">
+        <h3>Token intensity</h3>
+        <p>Total means input plus cached plus output. Cache-heavy sessions will dominate the scale.</p>
+        {html_token_bar('Input', stats['tokens']['input'], token_total, 'input')}
+        {html_token_bar('Cached', stats['tokens']['cached'], token_total, 'cached')}
+        {html_token_bar('Output', stats['tokens']['output'], token_total, 'output')}
+        {html_token_bar('Total', stats['tokens']['total'], token_total, 'total')}
+      </div>
+      <div class="detail-grid">
+        {html_models_panel(stats, 5)}
+        {html_share_list('Reasoning effort', efforts, 'No effort markers')}
+        {html_simple_list('Top repos', top_repos)}
+        {html_simple_list('Languages', top_langs)}
+        {html_simple_list('Daily active', top_days)}
+      </div>
+    </section>"""
+
+
+def render_html_document(scope_title: str, combined_stats: dict, codex_stats: dict, claude_stats: dict, pi_stats: dict) -> str:
+    combined_cost = estimate_stats_total_cost(combined_stats, PRICING_MAP)
+    generated = NOW.strftime("%b %d, %Y · %I:%M %p")
+    source_count = 2 + (1 if INCLUDE_CLAUDE else 0)
+    sections = [
+        html_source_section("Combined", combined_stats, "oklch(0.681 0.132 258.4)"),
+        html_source_section("Codex", codex_stats, "oklch(0.68 0.13 258)"),
+    ]
+    if INCLUDE_CLAUDE:
+        sections.append(html_source_section("Claude Code", claude_stats, "oklch(0.70 0.13 35)"))
+    sections.append(html_source_section("Pi", pi_stats, "oklch(0.74 0.14 150)"))
+    no_data = "" if combined_stats["session_count"] else "<p class=\"notice\">No sessions found in this range.</p>"
+    sources_note = "Codex: ~/.codex/sessions · Pi: ~/.pi/agent/sessions"
+    if INCLUDE_CLAUDE:
+        sources_note += " · Claude Code: ~/.claude/projects"
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent usage report · {h(scope_title)}</title>
+<style>
+:root {{
+  color-scheme: dark;
+  --bg: oklch(0.075 0 0);
+  --surface: oklch(0.135 0.010 258);
+  --surface-2: oklch(0.175 0.014 258);
+  --line: oklch(0.285 0.020 258);
+  --ink: oklch(0.940 0.010 258);
+  --muted: oklch(0.720 0.018 258);
+  --soft: oklch(0.560 0.030 258);
+  --primary: oklch(0.681 0.132 258.4);
+  --accent: oklch(0.760 0.150 70);
+  --input: oklch(0.690 0.130 300);
+  --cache: oklch(0.760 0.115 205);
+  --output: oklch(0.780 0.145 82);
+  --total: oklch(0.681 0.132 258.4);
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  margin: 0;
+  background: radial-gradient(circle at 82% -12%, oklch(0.23 0.07 258 / 0.55), transparent 34rem), var(--bg);
+  color: var(--ink);
+  font: 500 15px/1.55 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}}
+a {{ color: var(--primary); }}
+.report-shell {{ width: min(1280px, calc(100% - 32px)); margin: 0 auto; padding: 34px 0 56px; }}
+.report-hero {{
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 28px;
+  align-items: end;
+  padding: 30px;
+  border: 1px solid var(--line);
+  background: linear-gradient(135deg, oklch(0.155 0.018 258), oklch(0.105 0.006 258));
+}}
+.kicker {{ margin: 0 0 10px; color: var(--accent); font-size: 0.78rem; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; }}
+h1 {{ margin: 0; font-size: 2.75rem; line-height: 1.02; letter-spacing: -0.025em; text-wrap: balance; }}
+.hero-copy {{ max-width: 72ch; margin: 16px 0 0; color: var(--muted); }}
+.hero-aside {{ min-width: 270px; padding: 18px; background: var(--bg); border: 1px solid var(--line); }}
+.hero-aside p {{ margin: 0; color: var(--muted); }}
+.hero-aside b {{ display: block; color: var(--ink); font-size: 1.05rem; margin-top: 4px; }}
+.summary-grid {{ display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 1px; margin: 1px 0 0; background: var(--line); border: 1px solid var(--line); border-top: 0; }}
+.metric {{ padding: 18px; background: var(--surface); }}
+.metric dt {{ color: var(--muted); font-size: 0.82rem; }}
+.metric dd {{ margin: 4px 0 0; color: var(--ink); font-size: 1.45rem; font-weight: 800; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }}
+.metric span {{ display: block; margin-top: 3px; color: var(--soft); font-size: 0.78rem; }}
+.notice {{ margin: 18px 0 0; padding: 14px 16px; background: oklch(0.22 0.03 70); border: 1px solid oklch(0.44 0.08 70); color: var(--ink); }}
+.activity-strip {{ display: grid; grid-template-columns: 270px minmax(0, 1fr); gap: 24px; align-items: end; margin: 24px 0; padding: 22px; background: var(--surface); border: 1px solid var(--line); }}
+.activity-strip h3 {{ margin: 0; font-size: 1rem; }}
+.activity-strip p {{ margin: 5px 0 0; color: var(--muted); font-size: 0.88rem; }}
+.bars {{ height: 96px; display: flex; gap: 4px; align-items: end; }}
+.bars span {{ flex: 1; min-width: 3px; background: var(--primary); opacity: 0.92; }}
+.source-block {{ margin-top: 24px; border: 1px solid var(--line); background: var(--surface); }}
+.source-head {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(380px, 0.8fr); gap: 1px; background: var(--line); border-bottom: 1px solid var(--line); }}
+.source-head > div, .source-head dl {{ margin: 0; background: color-mix(in oklch, var(--surface), var(--tone) 5%); }}
+.source-head > div {{ padding: 24px; }}
+.source-label {{ margin: 0 0 6px; color: var(--tone); font-weight: 850; }}
+.source-head h2 {{ margin: 0; font-size: 2rem; letter-spacing: -0.025em; font-variant-numeric: tabular-nums; }}
+.source-head dl {{ display: grid; grid-template-columns: repeat(3, 1fr); }}
+.source-head .metric {{ background: transparent; }}
+.token-panel {{ padding: 22px 24px; border-bottom: 1px solid var(--line); }}
+.token-panel h3 {{ margin: 0; font-size: 1rem; }}
+.token-panel p {{ margin: 5px 0 16px; color: var(--muted); font-size: 0.9rem; }}
+.token-row {{ display: grid; grid-template-columns: 84px minmax(0, 1fr) 72px; gap: 14px; align-items: center; margin-top: 10px; }}
+.token-row span {{ color: var(--muted); }}
+.token-row b {{ text-align: right; font-variant-numeric: tabular-nums; }}
+.track {{ height: 10px; background: oklch(0.245 0.018 258); overflow: hidden; }}
+.track i {{ display: block; height: 100%; background: var(--tone); }}
+.token-row.input .track i {{ background: var(--input); }}
+.token-row.cached .track i {{ background: var(--cache); }}
+.token-row.output .track i {{ background: var(--output); }}
+.token-row.total .track i {{ background: var(--total); }}
+.detail-grid {{ display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 1px; background: var(--line); }}
+.mini-panel {{ min-width: 0; grid-column: span 4; padding: 18px; background: var(--surface-2); }}
+.mini-panel.wide {{ grid-column: span 6; }}
+.mini-panel h4 {{ margin: 0 0 12px; color: var(--ink); font-size: 0.92rem; }}
+.rank-list, .share-list, .model-list {{ list-style: none; padding: 0; margin: 0; }}
+.rank-list li {{ display: flex; justify-content: space-between; gap: 14px; padding: 8px 0; border-top: 1px solid oklch(0.30 0.018 258); }}
+.rank-list li:first-child {{ border-top: 0; }}
+.rank-list span, .share-head span, .model-top span {{ min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }}
+.rank-list b, .share-head b, .model-top b {{ color: var(--ink); font-weight: 750; font-variant-numeric: tabular-nums; }}
+.share-list li, .model-row {{ padding: 9px 0; border-top: 1px solid oklch(0.30 0.018 258); }}
+.share-list li:first-child, .model-row:first-child {{ border-top: 0; padding-top: 0; }}
+.share-head, .model-top {{ display: flex; justify-content: space-between; gap: 12px; margin-bottom: 8px; }}
+.share-list .track {{ height: 6px; }}
+.model-panel {{ background: color-mix(in oklch, var(--surface-2), var(--tone) 5%); }}
+.model-list .track {{ height: 7px; margin-bottom: 10px; }}
+.model-list .track i {{ background: var(--tone); }}
+.model-metrics {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; margin: 0; background: oklch(0.30 0.018 258); }}
+.model-metrics div {{ min-width: 0; padding: 9px 10px; background: oklch(0.145 0.010 258); }}
+.model-metrics dt {{ margin: 0; color: var(--soft); font-size: 0.72rem; }}
+.model-metrics dd {{ margin: 2px 0 0; color: var(--ink); font-weight: 850; font-variant-numeric: tabular-nums; }}
+.model-metrics small {{ display: block; margin-top: 1px; color: var(--muted); font-size: 0.70rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+.empty {{ color: var(--soft); }}
+.report-foot {{ margin-top: 26px; color: var(--muted); font-size: 0.9rem; }}
+.report-foot strong {{ color: var(--ink); }}
+@media (max-width: 980px) {{
+  .report-hero, .activity-strip, .source-head {{ grid-template-columns: 1fr; }}
+  .hero-aside {{ min-width: 0; }}
+  .summary-grid {{ grid-template-columns: repeat(2, 1fr); }}
+  .source-head dl {{ grid-template-columns: repeat(3, 1fr); }}
+  .detail-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+  .mini-panel {{ grid-column: span 1; }}
+  .mini-panel.wide {{ grid-column: span 2; }}
+}}
+@media (max-width: 760px) {{
+  .detail-grid {{ grid-template-columns: 1fr; }}
+  .mini-panel, .mini-panel.wide {{ grid-column: span 1; }}
+}}
+@media (max-width: 620px) {{
+  .report-shell {{ width: min(100% - 20px, 1280px); padding-top: 10px; }}
+  .report-hero {{ padding: 20px; }}
+  h1 {{ font-size: 2rem; }}
+  .summary-grid, .source-head dl, .model-metrics {{ grid-template-columns: 1fr; }}
+  .token-row {{ grid-template-columns: 68px minmax(0, 1fr) 58px; gap: 10px; }}
+}}
+@media print {{
+  body {{ background: white; color: black; }}
+  .report-shell {{ width: 100%; padding: 0; }}
+  .report-hero, .metric, .activity-strip, .source-block, .mini-panel {{ border-color: #999; background: white; color: black; }}
+}}
+</style>
+</head>
+<body>
+  <main class="report-shell">
+    <header class="report-hero">
+      <div>
+        <p class="kicker">Local usage dossier</p>
+        <h1>Agent usage report</h1>
+        <p class="hero-copy">A standalone HTML readout for local Codex, Pi, and optional Claude Code session history. Built for quick audit: time, tokens, model mix, costs, repositories, languages, and recent activity.</p>
+      </div>
+      <aside class="hero-aside" aria-label="Report context">
+        <p>Range <b>{h(scope_title)}</b></p>
+        <p>Generated <b>{h(generated)}</b></p>
+        <p>Sources <b>{source_count} local stores</b></p>
+      </aside>
+    </header>
+    <dl class="summary-grid" aria-label="Combined summary">
+      {html_metric('Active time', human_seconds(combined_stats['active_seconds']))}
+      {html_metric('Sessions', str(combined_stats['session_count']))}
+      {html_metric('Tokens', compact_tokens(combined_stats['tokens']['total']), 'input + cached + output')}
+      {html_metric('Estimated cost', usd(combined_cost), 'models.dev rate card when available')}
+    </dl>
+    {no_data}
+    {daily_strip(combined_stats, SCOPE)}
+    {''.join(sections)}
+    <footer class="report-foot">
+      <p><strong>Data sources:</strong> {h(sources_note)}</p>
+      <p>Cost is an estimate. Missing pricing data appears as n/a. This file is self-contained and reads no network resources.</p>
+    </footer>
+  </main>
+</body>
+</html>
+"""
+
+
+def emit_html_report(scope_title: str, combined_stats: dict, codex_stats: dict, claude_stats: dict, pi_stats: dict) -> None:
+    doc = render_html_document(scope_title, combined_stats, codex_stats, claude_stats, pi_stats)
+    if OUTPUT_PATH == "-":
+        print(doc)
+        return
+    if not OUTPUT_PATH:
+        raise SystemExit("missing html output path")
+    output = Path(OUTPUT_PATH).expanduser()
+    if output.parent != Path(""):
+        output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(doc, encoding="utf-8")
+
+
 all_sessions = collect_sessions()
 PRICING_MAP = load_pricing_map()
 start = scope_start(SCOPE)
@@ -841,27 +1242,30 @@ scope_title = {
     "30d": f"Last 30 Days (rolling) · since {(TODAY - dt.timedelta(days=29)).isoformat()}",
 }[SCOPE]
 
-print_banner(scope_title, combined)
-print_section("Combined", "95", combined)
-print_section("Codex", "94", codex)
-if INCLUDE_CLAUDE:
-    print_section("Claude Code", "35", claude)
-print_section("Pi", "92", pi)
-
-print(color("HIGHLIGHTS", "1;93"))
-if filtered:
-    longest = max(filtered, key=lambda s: s["active_seconds"])
-    print(
-        f"  {color('Longest active', '93')}  {bold(longest['source'])} {dim('·')} "
-        f"{color(human_seconds(longest['active_seconds']), '1;97')} {dim('·')} {color(longest['repo'], '96')}"
-    )
-    latest = max(filtered, key=lambda s: s["end"])
-    print(
-        f"  {color('Latest session', '95')}  {bold(latest['source'])} {dim('·')} "
-        f"{color(latest['end'].strftime('%b %d %I:%M %p'), '1;97')} {dim('·')} {color(latest['repo'], '96')}"
-    )
+if OUTPUT_MODE == "html":
+    emit_html_report(scope_title, combined, codex, claude, pi)
 else:
-    print(f"  {dim('No sessions found in this range.')}")
+    print_banner(scope_title, combined)
+    print_section("Combined", "95", combined)
+    print_section("Codex", "94", codex)
+    if INCLUDE_CLAUDE:
+        print_section("Claude Code", "35", claude)
+    print_section("Pi", "92", pi)
+
+    print(color("HIGHLIGHTS", "1;93"))
+    if filtered:
+        longest = max(filtered, key=lambda s: s["active_seconds"])
+        print(
+            f"  {color('Longest active', '93')}  {bold(longest['source'])} {dim('·')} "
+            f"{color(human_seconds(longest['active_seconds']), '1;97')} {dim('·')} {color(longest['repo'], '96')}"
+        )
+        latest = max(filtered, key=lambda s: s["end"])
+        print(
+            f"  {color('Latest session', '95')}  {bold(latest['source'])} {dim('·')} "
+            f"{color(latest['end'].strftime('%b %d %I:%M %p'), '1;97')} {dim('·')} {color(latest['repo'], '96')}"
+        )
+    else:
+        print(f"  {dim('No sessions found in this range.')}")
 PY
 }
 
@@ -886,7 +1290,41 @@ pick_scope() {
     "30d"
 }
 
-scope="$(pick_scope)" || exit 0
+open_html_report() {
+  local scope="$1"
+  local output_path="$2"
+  local should_open="$3"
+
+  render_report "$scope" "$INCLUDE_CLAUDE" html "$output_path"
+  if [[ "$output_path" != "-" ]]; then
+    printf "HTML report: %s\n" "$output_path"
+  fi
+  if [[ "$should_open" == "1" && "$output_path" != "-" ]]; then
+    if command -v xdg-open >/dev/null 2>&1; then
+      xdg-open "$output_path" >/dev/null 2>&1 &
+    else
+      printf "xdg-open not found. Open this file manually.\n"
+    fi
+  fi
+}
+
+if [[ -n "$SCOPE_ARG" ]]; then
+  scope="$SCOPE_ARG"
+else
+  scope="$(pick_scope)" || exit 0
+fi
+
+if [[ "$HTML_MODE" == "1" ]]; then
+  if [[ -z "$HTML_PATH" ]]; then
+    HTML_PATH="$(mktemp "${TMPDIR:-/tmp}/agent-usage-report.XXXXXX.html")"
+  fi
+  if [[ "$HTML_PATH_SET" == "1" ]]; then
+    open_html_report "$scope" "$HTML_PATH" 0
+  else
+    open_html_report "$scope" "$HTML_PATH" 1
+  fi
+  exit 0
+fi
 
 while true; do
   clear
@@ -896,11 +1334,18 @@ while true; do
   printf "\n"
   action="$(gum choose \
     --header "Choose an action" \
+    "Open HTML report" \
     "Change range" \
     "Refresh" \
     "Exit")" || exit 0
 
   case "$action" in
+    "Open HTML report")
+      output_path="$(mktemp "${TMPDIR:-/tmp}/agent-usage-report.XXXXXX.html")"
+      open_html_report "$scope" "$output_path" 1
+      printf "Press enter to continue..."
+      read -r _
+      ;;
     "Change range")
       scope="$(pick_scope)" || exit 0
       ;;

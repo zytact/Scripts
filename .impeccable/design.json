@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-06-10T00:00:00+00:00",
+  "title": "Design System: Agent Usage Report",
+  "extensions": {
+    "colorMeta": {
+      "bg": { "role": "neutral", "displayName": "Black Deck", "canonical": "oklch(0.075 0 0)", "tonalRamp": ["oklch(0.075 0 0)", "oklch(0.15 0 0)", "oklch(0.25 0 0)", "oklch(0.38 0 0)", "oklch(0.52 0 0)", "oklch(0.68 0 0)", "oklch(0.84 0 0)", "oklch(0.96 0 0)"] },
+      "primary": { "role": "primary", "displayName": "Cobalt Instrument Glow", "canonical": "oklch(0.681 0.132 258.4)", "tonalRamp": ["oklch(0.18 0.132 258.4)", "oklch(0.28 0.132 258.4)", "oklch(0.40 0.132 258.4)", "oklch(0.52 0.132 258.4)", "oklch(0.681 0.132 258.4)", "oklch(0.78 0.100 258.4)", "oklch(0.88 0.060 258.4)", "oklch(0.95 0.030 258.4)"] },
+      "accent": { "role": "secondary", "displayName": "Amber Attention Mark", "canonical": "oklch(0.760 0.150 70)", "tonalRamp": ["oklch(0.18 0.150 70)", "oklch(0.30 0.150 70)", "oklch(0.42 0.150 70)", "oklch(0.56 0.150 70)", "oklch(0.760 0.150 70)", "oklch(0.84 0.100 70)", "oklch(0.91 0.060 70)", "oklch(0.96 0.030 70)"] }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Report Display", "purpose": "Report title only." },
+      "body": { "displayName": "Product Body", "purpose": "Dense explanatory copy and UI text." },
+      "label": { "displayName": "Telemetry Label", "purpose": "Metric labels and compact captions." }
+    },
+    "shadows": [],
+    "motion": [
+      { "name": "state-fast", "value": "150ms ease-out", "purpose": "Future hover or focus state changes only." }
+    ],
+    "breakpoints": [
+      { "name": "tablet", "value": "980px" },
+      { "name": "mobile", "value": "620px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Report Panel",
+      "kind": "card",
+      "refersTo": "report-panel",
+      "description": "Flat joined container with a fine instrument line.",
+      "html": "<section class=\"ds-report-panel\"><h3>Token intensity</h3><p>Total means input plus cached plus output.</p></section>",
+      "css": ".ds-report-panel { background: oklch(0.135 0.010 258); color: oklch(0.940 0.010 258); border: 1px solid oklch(0.285 0.020 258); border-radius: 0; padding: 24px; font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; } .ds-report-panel h3 { margin: 0; font-size: 1rem; } .ds-report-panel p { margin: 6px 0 0; color: oklch(0.720 0.018 258); }"
+    },
+    {
+      "name": "Metric Cell",
+      "kind": "card",
+      "refersTo": "metric-cell",
+      "description": "Compact label plus tabular value cell for summary strips.",
+      "html": "<dl class=\"ds-metric\"><dt>Active time</dt><dd>4h 12m</dd></dl>",
+      "css": ".ds-metric { background: oklch(0.135 0.010 258); color: oklch(0.940 0.010 258); border: 1px solid oklch(0.285 0.020 258); border-radius: 0; padding: 18px; font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; } .ds-metric dt { color: oklch(0.720 0.018 258); font-size: 0.82rem; } .ds-metric dd { margin: 4px 0 0; font-size: 1.45rem; font-weight: 800; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }"
+    },
+    {
+      "name": "Token Bar",
+      "kind": "custom",
+      "description": "Fixed label, proportional track, and numeric value for token buckets.",
+      "html": "<div class=\"ds-token-row\"><span>Input</span><div class=\"ds-track\"><i style=\"width:66%\"></i></div><b>42.0k</b></div>",
+      "css": ".ds-token-row { display: grid; grid-template-columns: 84px minmax(0, 1fr) 72px; gap: 14px; align-items: center; color: oklch(0.940 0.010 258); font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; } .ds-token-row span { color: oklch(0.720 0.018 258); } .ds-token-row b { text-align: right; font-variant-numeric: tabular-nums; } .ds-track { height: 10px; background: oklch(0.245 0.018 258); overflow: hidden; } .ds-track i { display: block; height: 100%; background: oklch(0.681 0.132 258.4); }"
+    }
+  ],
+  "narrative": {
+    "northStar": "Pre-dawn flight deck",
+    "overview": "This system is a tactical report surface for local agent activity. It uses a near-black architectural ground, cobalt instrumentation, and amber attention marks to make dense data readable without becoming a terminal costume.",
+    "keyCharacteristics": ["Dense but scannable.", "Dark, precise, and low glare.", "Cobalt primary with amber emphasis.", "Flat at rest, with depth created through tonal layers.", "Product UI first, visual identity second."],
+    "rules": [
+      { "name": "The No Purple SaaS Rule", "body": "Purple gradients are prohibited. Cobalt is a functional instrument color, not a gradient decoration.", "section": "colors" },
+      { "name": "The One Accent Rule", "body": "Amber appears only where the eye needs to land. If it covers more than a few labels or badges, the report is too loud.", "section": "colors" },
+      { "name": "The No Terminal Type Rule", "body": "Do not use monospace as the primary voice. Tabular numerals are allowed for alignment, but the report must not look like an ANSI terminal dump.", "section": "typography" },
+      { "name": "The Joined Surface Rule", "body": "Related data should connect edge to edge with shared dividers. Do not scatter unrelated floating cards across the canvas.", "section": "elevation" }
+    ],
+    "dos": ["Do keep the report dense, with clear seams and compact rank lists.", "Do use OKLCH tokens directly in CSS.", "Do reserve amber for labels and attention marks.", "Do keep estimates honest: missing pricing data must read as n/a.", "Do keep the HTML standalone, with no external fonts, scripts, or assets."],
+    "donts": ["Don't use generic SaaS card grids, purple gradients, decorative glass panels, terminal-type novelty, console/ANSI clones, or overly playful marketing visuals.", "Don't use decorative shadows or frosted panels.", "Don't add rounded 32px cards or pill-shaped report panels.", "Don't use gradient text.", "Don't let long model names overflow their container."]
+  }
+}
