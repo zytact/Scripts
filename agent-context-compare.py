@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import sys
 import tempfile
 import urllib.request
@@ -25,6 +26,8 @@ PRICING_CACHE_FILE = DEFAULT_BASELINE_DIR / "pricing-cache.json"
 MODELS_DEV_URL = "https://raw.githubusercontent.com/anomalyco/models.dev/dev/models.json"
 GPT_MODEL_RE = re.compile(r"^gpt-[\w.-]+$", re.I)
 DATE_FMT = "%Y-%m-%d"
+OPENCODE_DIR = Path.home() / ".local" / "share" / "opencode"
+OPENCODE_DB = OPENCODE_DIR / "opencode.db"
 
 BUILTIN_PRICING: dict[str, dict[str, str]] = {
     # Per token USD. Prefer models.dev; these are fallback placeholders and easy to edit.
@@ -82,6 +85,7 @@ class SessionRecord:
     active_seconds: int
     cwd: str | None
     repo: str
+    originator: str | None = None
     model_counts: Counter[str] = field(default_factory=Counter)
     model_usage: dict[str, Usage] = field(default_factory=dict)
     reasoning: Counter[str] = field(default_factory=Counter)
@@ -188,6 +192,13 @@ def repo_name(cwd: str | None) -> str:
 
 def text_size(value: str) -> int:
     return len(value or "")
+
+
+def is_t3code_opencode_session(title: str | None, metadata: Any) -> bool:
+    title_text = str(title or "").strip()
+    if re.search(r"^T3 Code(?:\s|$)", title_text, re.IGNORECASE):
+        return True
+    return "t3code" in str(metadata or "").lower()
 
 
 def classify_command(command: str) -> set[str]:
@@ -488,6 +499,7 @@ class CodexParser(BaseParser):
     def parse_file(self, file_path: Path) -> SessionRecord | None:
         session_id = file_path.stem
         cwd = None
+        originator = None
         events: list[dt.datetime] = []
         model_counts: Counter[str] = Counter()
         reasoning: Counter[str] = Counter()
@@ -522,6 +534,7 @@ class CodexParser(BaseParser):
                 if typ == "session_meta":
                     session_id = payload.get("id") or session_id
                     cwd = payload.get("cwd") or cwd
+                    originator = payload.get("originator") or originator
                 elif typ == "turn_context":
                     model = payload.get("model")
                     if model:
@@ -608,6 +621,7 @@ class CodexParser(BaseParser):
             active_seconds=active_seconds,
             cwd=cwd,
             repo=repo_name(cwd),
+            originator=str(originator) if originator else None,
             model_counts=model_counts,
             model_usage=model_usage,
             reasoning=reasoning,
@@ -630,6 +644,233 @@ class CodexParser(BaseParser):
             if delta > 0:
                 total += min(delta, ACTIVE_GAP_SECONDS)
         return max(total, MIN_MEANINGFUL_SESSION_SECONDS)
+
+
+class OpencodeParser(BaseParser):
+    agent = "opencode"
+
+    def iter_files(self) -> Iterable[Path]:
+        return [self.root] if self.root.exists() else []
+
+    def parse_all(self) -> list[SessionRecord]:
+        if not self.root.exists():
+            return []
+        try:
+            conn = sqlite3.connect(f"file:{self.root}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+        except sqlite3.Error as exc:
+            eprint(f"warning: failed opening opencode db {self.root}: {exc}")
+            return []
+        try:
+            session_rows = conn.execute(
+                """
+                select id, directory, title, time_created, time_updated, model, metadata,
+                       tokens_input, tokens_output, tokens_reasoning,
+                       tokens_cache_read, tokens_cache_write
+                from session
+                """
+            ).fetchall()
+            message_rows = conn.execute(
+                """
+                select id, session_id, time_created, time_updated, data
+                from message
+                order by session_id, time_created, id
+                """
+            ).fetchall()
+            part_rows = conn.execute(
+                """
+                select message_id, session_id, time_created, time_updated, data
+                from part
+                order by session_id, time_created, id
+                """
+            ).fetchall()
+        except sqlite3.Error as exc:
+            eprint(f"warning: failed reading opencode db {self.root}: {exc}")
+            return []
+        finally:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+        def parse_epoch_ms(value: Any) -> dt.datetime | None:
+            try:
+                return dt.datetime.fromtimestamp(int(value) / 1000, tz=dt.timezone.utc).astimezone()
+            except Exception:
+                return None
+
+        grouped_messages: defaultdict[str, list[sqlite3.Row]] = defaultdict(list)
+        for row in message_rows:
+            grouped_messages[str(row["session_id"])] += [row]
+
+        grouped_parts: defaultdict[str, list[sqlite3.Row]] = defaultdict(list)
+        for row in part_rows:
+            grouped_parts[str(row["message_id"])] += [row]
+
+        sessions: list[SessionRecord] = []
+        for row in session_rows:
+            session_id = str(row["id"])
+            cwd = row["directory"]
+            originator = "t3code_desktop" if is_t3code_opencode_session(row["title"], row["metadata"]) else "opencode"
+            events: list[dt.datetime] = []
+            model_counts: Counter[str] = Counter()
+            model_usage: dict[str, Usage] = defaultdict(Usage)
+            reasoning: Counter[str] = Counter()
+            warnings: list[str] = []
+            turn_fresh_inputs: list[int] = []
+            tool_call_count = 0
+            largest_file_reads: list[tuple[int, str]] = []
+            largest_search_outputs: list[tuple[int, str]] = []
+            fresh_after_file_reads = 0
+            fresh_after_test_logs = 0
+            fresh_after_edits_diffs = 0
+            pending_tags: set[str] = set()
+            malformed = 0
+            fallback_model = None
+
+            for raw_ts in (row["time_created"], row["time_updated"]):
+                ts = parse_epoch_ms(raw_ts)
+                if ts:
+                    events.append(ts)
+            try:
+                model_info = json.loads(row["model"] or "{}")
+            except Exception:
+                model_info = {}
+            if isinstance(model_info, dict):
+                fallback_model = model_info.get("id")
+                variant = model_info.get("variant")
+                if variant:
+                    reasoning[str(variant)] += 1
+
+            for message in grouped_messages.get(session_id, []):
+                for raw_ts in (message["time_created"], message["time_updated"]):
+                    ts = parse_epoch_ms(raw_ts)
+                    if ts:
+                        events.append(ts)
+                raw_data = message["data"] or ""
+                try:
+                    data = json.loads(raw_data)
+                except Exception:
+                    malformed += 1
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                time_info = data.get("time") or {}
+                if isinstance(time_info, dict):
+                    for raw_ts in (time_info.get("created"), time_info.get("completed")):
+                        ts = parse_epoch_ms(raw_ts)
+                        if ts:
+                            events.append(ts)
+                path_info = data.get("path") or {}
+                if isinstance(path_info, dict):
+                    cwd = cwd or path_info.get("cwd") or path_info.get("root")
+                variant = data.get("variant")
+                if variant:
+                    reasoning[str(variant)] += 1
+
+                for part in grouped_parts.get(str(message["id"]), []):
+                    for raw_ts in (part["time_created"], part["time_updated"]):
+                        ts = parse_epoch_ms(raw_ts)
+                        if ts:
+                            events.append(ts)
+                    try:
+                        p = json.loads(part["data"] or "{}")
+                    except Exception:
+                        malformed += 1
+                        continue
+                    if not isinstance(p, dict) or p.get("type") != "tool":
+                        continue
+                    tool_call_count += 1
+                    tool_name = str(p.get("tool") or "")
+                    state = p.get("state") if isinstance(p.get("state"), dict) else {}
+                    inp = state.get("input") if isinstance(state.get("input"), dict) else {}
+                    out = str(state.get("output") or "")
+                    command = str(inp.get("command") or inp.get("cmd") or inp.get("query") or inp.get("filePath") or "")
+                    tags = classify_tool(tool_name, command)
+                    pending_tags |= tags
+                    size = text_size(out)
+                    label = f"{session_id}: {out[:80].replace(chr(10), ' ')}"
+                    if "file_read" in tags:
+                        add_top_item(largest_file_reads, size, label)
+                    if "search" in tags:
+                        add_top_item(largest_search_outputs, size, label)
+
+                if data.get("role") != "assistant":
+                    continue
+                model_name = str(data.get("modelID") or fallback_model or "unknown")
+                model_counts[model_name] += 1
+                usage = data.get("tokens") or {}
+                if not isinstance(usage, dict):
+                    usage = {}
+                cache = usage.get("cache") or {}
+                if not isinstance(cache, dict):
+                    cache = {}
+                fresh = int(usage.get("input") or 0) + int(cache.get("write") or 0)
+                cached = int(cache.get("read") or 0)
+                output = int(usage.get("output") or 0)
+                reasoning_output = int(usage.get("reasoning") or 0)
+                total = int(usage.get("total") or (fresh + cached + output))
+                turn_fresh_inputs.append(fresh)
+                if "file_read" in pending_tags:
+                    fresh_after_file_reads += fresh
+                if "test_log" in pending_tags:
+                    fresh_after_test_logs += fresh
+                if "edit_diff" in pending_tags:
+                    fresh_after_edits_diffs += fresh
+                pending_tags.clear()
+                u = model_usage[model_name]
+                u.fresh_input += fresh
+                u.cached_input += cached
+                u.output += output
+                u.reasoning_output += reasoning_output
+                u.total += total
+                u.source_total = (u.source_total or 0) + total
+                u.cache_known = True
+
+            if not events:
+                continue
+            if not model_usage and fallback_model:
+                model_counts[str(fallback_model)] += 1
+                u = model_usage[str(fallback_model)]
+                u.fresh_input += int(row["tokens_input"] or 0) + int(row["tokens_cache_write"] or 0)
+                u.cached_input += int(row["tokens_cache_read"] or 0)
+                u.output += int(row["tokens_output"] or 0)
+                u.reasoning_output += int(row["tokens_reasoning"] or 0)
+                total = u.fresh_input + u.cached_input + u.output
+                u.total += total
+                u.source_total = (u.source_total or 0) + total
+                u.cache_known = True
+            if not model_usage:
+                warnings.append("no usage-bearing messages")
+            for usage in model_usage.values():
+                usage.finalize()
+                if not usage.total_reconciled:
+                    warnings.append("token total does not reconcile")
+            events.sort()
+            sessions.append(SessionRecord(
+                agent=self.agent,
+                session_id=session_id,
+                file_path=str(self.root),
+                start=events[0],
+                end=events[-1],
+                active_seconds=CodexParser._active_seconds(events),
+                cwd=cwd,
+                repo=repo_name(cwd),
+                originator=originator,
+                model_counts=model_counts,
+                model_usage=dict(model_usage),
+                reasoning=reasoning,
+                warnings=warnings,
+                malformed_lines=malformed,
+                turn_fresh_inputs=turn_fresh_inputs,
+                tool_call_count=tool_call_count,
+                largest_file_reads=largest_file_reads,
+                largest_search_outputs=largest_search_outputs,
+                fresh_after_file_reads=fresh_after_file_reads,
+                fresh_after_test_logs=fresh_after_test_logs,
+                fresh_after_edits_diffs=fresh_after_edits_diffs,
+            ))
+        return sessions
 
 
 class PiParser(BaseParser):
@@ -848,6 +1089,26 @@ def gpt_models_from_sessions(sessions: list[SessionRecord]) -> set[str]:
     return models
 
 
+def matched_model_filter(left: list[SessionRecord], right: list[SessionRecord], model_allow: set[str] | None = None) -> set[str]:
+    shared = gpt_models_from_sessions(left) & gpt_models_from_sessions(right)
+    return (model_allow or shared) & shared
+
+
+def source_slice(name: str, left_sessions: list[SessionRecord], right_sessions: list[SessionRecord], repo: str | None, model_allow: set[str] | None = None) -> dict[str, Any] | None:
+    model_filter = matched_model_filter(left_sessions, right_sessions, model_allow)
+    left_agg = aggregate_sessions(left_sessions, model_filter, repo)
+    right_agg = aggregate_sessions(right_sessions, model_filter, repo)
+    if left_agg.session_count == 0 or right_agg.session_count == 0 or not model_filter:
+        return None
+    return {
+        "name": name,
+        "model_filter": model_filter,
+        "left": left_agg,
+        "right": right_agg,
+        "fairness": fairness_warnings(left_agg, right_agg, left_agg.model_counts, right_agg.model_counts, repo, name, "Pi"),
+    }
+
+
 def aggregate_sessions(sessions: list[SessionRecord], model_filter: set[str] | None = None, repo_filter: str | None = None) -> Aggregate:
     agg = Aggregate()
     for s in sessions:
@@ -927,7 +1188,7 @@ def apply_costs(sessions: list[SessionRecord], pricing: dict[str, dict[str, Deci
             usage.finalize()
 
 
-def fairness_warnings(codex: Aggregate, pi: Aggregate, codex_models: Counter[str], pi_models: Counter[str], repo_filter: str | None) -> list[str]:
+def fairness_warnings(codex: Aggregate, pi: Aggregate, codex_models: Counter[str], pi_models: Counter[str], repo_filter: str | None, left_name: str = "Codex", right_name: str = "Pi") -> list[str]:
     out: list[str] = []
     ch = codex.active_seconds / 3600
     ph = pi.active_seconds / 3600
@@ -935,18 +1196,18 @@ def fairness_warnings(codex: Aggregate, pi: Aggregate, codex_models: Counter[str
         bigger = max(ch, ph)
         smaller = min(ch, ph)
         if smaller / bigger < 0.6:
-            out.append(f"active time differs a lot: Codex {ch:.2f}h vs Pi {ph:.2f}h")
+            out.append(f"active time differs a lot: {left_name} {ch:.2f}h vs {right_name} {ph:.2f}h")
     if codex.session_count < 3 or pi.session_count < 3:
-        out.append(f"few sessions: Codex {codex.session_count}, Pi {pi.session_count}")
+        out.append(f"few sessions: {left_name} {codex.session_count}, {right_name} {pi.session_count}")
     if ch < 0.5 or ph < 0.5:
-        out.append(f"low active time: Codex {ch:.2f}h, Pi {ph:.2f}h")
+        out.append(f"low active time: {left_name} {ch:.2f}h, {right_name} {ph:.2f}h")
     if not repo_filter and codex.repo_counts and pi.repo_counts and codex.repo_counts.most_common(1)[0][0] != pi.repo_counts.most_common(1)[0][0]:
-        out.append(f"top repo differs: Codex {codex.repo_counts.most_common(1)[0][0]} vs Pi {pi.repo_counts.most_common(1)[0][0]}")
+        out.append(f"top repo differs: {left_name} {codex.repo_counts.most_common(1)[0][0]} vs {right_name} {pi.repo_counts.most_common(1)[0][0]}")
     if codex_models and pi_models:
         c_top = codex_models.most_common(1)[0][0]
         p_top = pi_models.most_common(1)[0][0]
         if c_top != p_top:
-            out.append(f"top GPT model differs: Codex {c_top} vs Pi {p_top}")
+            out.append(f"top GPT model differs: {left_name} {c_top} vs {right_name} {p_top}")
     if not codex.usage.cache_known or not pi.usage.cache_known:
         out.append("cached token data missing on one or both sides")
     if codex.usage.cost is None or pi.usage.cost is None:
@@ -965,12 +1226,12 @@ def agent_card_lines(agent_name: str, agg: Aggregate) -> list[str]:
         f"fresh       {compact_int(agg.usage.fresh_input)}    cached     {compact_int(agg.usage.cached_input)}",
         f"output      {compact_int(agg.usage.output)}    total      {compact_int(agg.usage.total)}",
         f"cost        {cost_str(agg.usage.cost)}    cache      {fmt_pct(m['cache_ratio'])}",
-        f"fresh/hr    {fmt_decimal(m['fresh_input_per_active_hour'])}",
-        f"cached/hr   {fmt_decimal(m['cached_input_per_active_hour'])}",
-        f"output/hr   {fmt_decimal(m['output_per_active_hour'])}",
+        f"fresh/hr    {compact_number(m['fresh_input_per_active_hour'])}",
+        f"cached/hr   {compact_number(m['cached_input_per_active_hour'])}",
+        f"output/hr   {compact_number(m['output_per_active_hour'])}",
         f"cost/hr     {cost_str(m['cost_per_active_hour'])}",
-        f"tool calls  {agg.tool_call_count}    fresh/tool {fmt_decimal(m['fresh_input_per_tool_call'])}",
-        f"ctx Δ/turn  {fmt_decimal(m['context_growth_per_turn'])}",
+        f"tool calls  {agg.tool_call_count}    fresh/tool {compact_number(m['fresh_input_per_tool_call'])}",
+        f"ctx Δ/turn  {compact_number(m['context_growth_per_turn'])}",
     ]
 
 
@@ -986,8 +1247,8 @@ def print_side_by_side(title: str, left_title: str, left_lines: list[str], right
 
 
 def compare_row(label: str, codex_value: float | None, pi_value: float | None, lower_is_better: bool = True, kind: str = "lower") -> str:
-    cv = fmt_pct(codex_value) if kind == "pct" else (cost_str(codex_value) if kind == "cost" else fmt_decimal(codex_value))
-    pv = fmt_pct(pi_value) if kind == "pct" else (cost_str(pi_value) if kind == "cost" else fmt_decimal(pi_value))
+    cv = fmt_pct(codex_value) if kind == "pct" else (cost_str(codex_value) if kind == "cost" else compact_number(codex_value))
+    pv = fmt_pct(pi_value) if kind == "pct" else (cost_str(pi_value) if kind == "cost" else compact_number(pi_value))
     diff = pct_diff(pi_value, codex_value)
     winner = "n/a"
     if codex_value is not None and pi_value is not None:
@@ -1026,7 +1287,7 @@ def print_diagnostic_box(title: str, codex_agg: Aggregate, pi_agg: Aggregate) ->
         f"fresh after file reads   C {compact_int(codex_agg.fresh_after_file_reads)}   P {compact_int(pi_agg.fresh_after_file_reads)}",
         f"fresh after test logs    C {compact_int(codex_agg.fresh_after_test_logs)}   P {compact_int(pi_agg.fresh_after_test_logs)}",
         f"fresh after edits/diffs  C {compact_int(codex_agg.fresh_after_edits_diffs)}   P {compact_int(pi_agg.fresh_after_edits_diffs)}",
-        f"avg fresh/turn           C {fmt_decimal(cm['avg_turn_fresh_input'])}   P {fmt_decimal(pm['avg_turn_fresh_input'])}",
+        f"avg fresh/turn           C {compact_number(cm['avg_turn_fresh_input'])}   P {compact_number(pm['avg_turn_fresh_input'])}",
         "largest file reads:",
     ]
     if codex_agg.largest_file_reads:
@@ -1039,6 +1300,74 @@ def print_diagnostic_box(title: str, codex_agg: Aggregate, pi_agg: Aggregate) ->
     if pi_agg.largest_search_outputs:
         lines.extend([f"  P {compact_int(sz)}  {label[:70]}" for sz, label in pi_agg.largest_search_outputs[:3]])
     for line in boxed_lines(title, lines, "bright_magenta"):
+        print(line)
+
+
+def quota_burn_metrics(agg: Aggregate) -> dict[str, Any]:
+    m = metrics(agg)
+    active_hours = m["active_hours"]
+    total_hour = agg.usage.total / active_hours if active_hours else None
+    cached_to_fresh = ratio(agg.usage.cached_input, agg.usage.fresh_input)
+    input_hour = (agg.usage.fresh_input + agg.usage.cached_input) / active_hours if active_hours else None
+    return {
+        **m,
+        "input_per_active_hour": input_hour,
+        "total_per_active_hour": total_hour,
+        "cached_to_fresh_ratio": cached_to_fresh,
+    }
+
+
+def diagnosis_payload(codex_agg: Aggregate, pi_agg: Aggregate, fairness: list[str]) -> dict[str, Any]:
+    cm = quota_burn_metrics(codex_agg)
+    pm = quota_burn_metrics(pi_agg)
+    pressure_ratio = ratio(cm["total_per_active_hour"] or 0, pm["total_per_active_hour"] or 0)
+    suspects: list[str] = []
+    if (cm["cached_input_per_active_hour"] or 0) > (pm["cached_input_per_active_hour"] or 0) * 1.5:
+        suspects.append("cached context carryover")
+    if (cm["fresh_input_per_active_hour"] or 0) > (pm["fresh_input_per_active_hour"] or 0) * 1.2:
+        suspects.append("larger fresh prompts/tool results")
+    if (cm["output_per_active_hour"] or 0) > (pm["output_per_active_hour"] or 0) * 1.2:
+        suspects.append("larger model outputs")
+    if codex_agg.largest_file_reads or codex_agg.largest_search_outputs:
+        max_codex_tool = max([0] + [sz for sz, _ in codex_agg.largest_file_reads + codex_agg.largest_search_outputs])
+        max_pi_tool = max([0] + [sz for sz, _ in pi_agg.largest_file_reads + pi_agg.largest_search_outputs])
+        if max_codex_tool > max_pi_tool * 1.2 or max_codex_tool > 25_000:
+            suspects.append("large tool outputs entering history")
+    return {
+        "codex": cm,
+        "pi": pm,
+        "codex_total_pressure_vs_pi": pressure_ratio,
+        "suspects": suspects or ["no single obvious token driver"],
+        "caveats": fairness,
+        "recommended_codex_config": {
+            "model_reasoning_effort": "minimal",
+            "model_verbosity": "low",
+            "tool_output_token_limit": 6000,
+            "project_doc_max_bytes": 12000,
+            "web_search": "disabled if not needed",
+        },
+    }
+
+
+def print_quota_burn_diagnosis(codex_agg: Aggregate, pi_agg: Aggregate, fairness: list[str]) -> None:
+    d = diagnosis_payload(codex_agg, pi_agg, fairness)
+    cm = d["codex"]
+    pm = d["pi"]
+    lines = [
+        f"pressure/hr total     C {compact_number(cm['total_per_active_hour'])}   P {compact_number(pm['total_per_active_hour'])}   ratio {fmt_decimal(d['codex_total_pressure_vs_pi'], 2, 'x')}",
+        f"input/hr fresh+cache  C {compact_number(cm['input_per_active_hour'])}   P {compact_number(pm['input_per_active_hour'])}",
+        f"cached/hr             C {compact_number(cm['cached_input_per_active_hour'])}   P {compact_number(pm['cached_input_per_active_hour'])}",
+        f"cached:fresh          C {fmt_decimal(cm['cached_to_fresh_ratio'], 2, 'x')}   P {fmt_decimal(pm['cached_to_fresh_ratio'], 2, 'x')}",
+        f"fresh/tool            C {compact_number(cm['fresh_input_per_tool_call'])}   P {compact_number(pm['fresh_input_per_tool_call'])}",
+        "likely drivers: " + ", ".join(d["suspects"]),
+        "fix: cap tool_output_token_limit; avoid broad rg/cat/diff/test logs",
+        "fix: use minimal reasoning + low verbosity for routine work",
+        "fix: start fresh/compact after huge outputs; disable unused plugins/apps",
+    ]
+    if fairness:
+        lines.append("caution: " + "; ".join(fairness[:2]))
+    lines.append("note: ctx Δ/turn is noisy after compaction/cache resets")
+    for line in boxed_lines("quota burn diagnosis", lines, "bright_red"):
         print(line)
 
 
@@ -1352,6 +1681,38 @@ def html_compare_table(codex_agg: Aggregate, pi_agg: Aggregate) -> tuple[str, li
       </section>""", rows
 
 
+def html_quota_diagnosis_panel(codex_agg: Aggregate, pi_agg: Aggregate, fairness: list[str]) -> str:
+    d = diagnosis_payload(codex_agg, pi_agg, fairness)
+    cm = d["codex"]
+    pm = d["pi"]
+    rows = [
+        ("Total pressure/hour", compact_number(cm["total_per_active_hour"]), compact_number(pm["total_per_active_hour"]), f"{fmt_decimal(d['codex_total_pressure_vs_pi'], 2, 'x')} Codex/Pi"),
+        ("Fresh+cached input/hour", compact_number(cm["input_per_active_hour"]), compact_number(pm["input_per_active_hour"]), pct_diff(pm["input_per_active_hour"], cm["input_per_active_hour"])),
+        ("Cached/hour", compact_number(cm["cached_input_per_active_hour"]), compact_number(pm["cached_input_per_active_hour"]), pct_diff(pm["cached_input_per_active_hour"], cm["cached_input_per_active_hour"])),
+        ("Cached:fresh", fmt_decimal(cm["cached_to_fresh_ratio"], 2, "x"), fmt_decimal(pm["cached_to_fresh_ratio"], 2, "x"), "carryover signal"),
+    ]
+    body = "".join(f"<tr><th>{h(label)}</th><td>{h(cval)}</td><td>{h(pval)}</td><td>{h(note)}</td></tr>" for label, cval, pval, note in rows)
+    suspects = "".join(f"<li>{h(s)}</li>" for s in d["suspects"])
+    fixes = "".join(f"<li>{h(x)}</li>" for x in [
+        "Set tool_output_token_limit around 6000–12000.",
+        "Use minimal reasoning + low verbosity for routine edits.",
+        "Avoid broad rg/cat/git diff/test log dumps; cap with head/sed.",
+        "Start fresh or compact after huge tool outputs; disable unused plugins/apps.",
+    ])
+    return f"""
+      <section class="diagnosis-panel board-panel">
+        <header><h2>Quota burn diagnosis</h2><p>Rate-limit pressure proxy: fresh + cached + output per active hour.</p></header>
+        <table>
+          <thead><tr><th>Metric</th><th>Codex</th><th>Pi</th><th>Note</th></tr></thead>
+          <tbody>{body}</tbody>
+        </table>
+        <div class="diagnosis-grid">
+          <section><h3>Likely drivers</h3><ul>{suspects}</ul></section>
+          <section><h3>Fixes</h3><ul>{fixes}</ul></section>
+        </div>
+      </section>"""
+
+
 def html_probe_panel(codex_agg: Aggregate, pi_agg: Aggregate) -> str:
     items = [
         ("After file reads", codex_agg.fresh_after_file_reads, pi_agg.fresh_after_file_reads),
@@ -1427,6 +1788,47 @@ def html_repo_slices(codex_filtered: list[SessionRecord], pi_filtered: list[Sess
       </section>"""
 
 
+def print_extra_source_slices(slices: list[dict[str, Any]]) -> None:
+    if not slices:
+        return
+    print(c("1b) Extra source slices vs Pi", "bold", "white"))
+    for item in slices:
+        print()
+        print_side_by_side("", item["name"], agent_card_lines(item["name"], item["left"]), "Pi", agent_card_lines("Pi", item["right"]))
+        print_comparison_table(f"{item['name']} winner board", item["left"], item["right"])
+
+
+def html_extra_source_slices(slices: list[dict[str, Any]]) -> str:
+    if not slices:
+        return ""
+    cards = []
+    for item in slices:
+        lm = metrics(item["left"])
+        pm = metrics(item["right"])
+        total_cmp = compare_metric("Total/hour", item["left"].usage.total / max(lm["active_hours"], 1e-9) if lm["active_hours"] else None, item["right"].usage.total / max(pm["active_hours"], 1e-9) if pm["active_hours"] else None, True)
+        cost_cmp = compare_metric("Cost/hour", lm["cost_per_active_hour"], pm["cost_per_active_hour"], True, "cost")
+        cache_cmp = compare_metric("Cache ratio", lm["cache_ratio"], pm["cache_ratio"], False, "pct")
+        warnings = "".join(f"<li>{h(w)}</li>" for w in item["fairness"][:3]) or '<li class="ok">No caution flags.</li>'
+        cards.append(f"""
+        <article class="model-card extra-source-card">
+          <header><h3>{h(item['name'])}</h3><span>vs Pi</span></header>
+          <div class="model-duo">
+            <div><b>{h(item['name'])}</b><span>{h(compact_int(item['left'].usage.total))}</span></div>
+            <div><b>Pi</b><span>{h(compact_int(item['right'].usage.total))}</span></div>
+          </div>
+          <div class="mini-compare-grid">
+            <div><dt>Fresh/hr</dt><dd>{h(html_value(lm['fresh_input_per_active_hour']))}</dd><small>{h(item['name'])}</small></div>
+            <div><dt>Fresh/hr</dt><dd>{h(html_value(pm['fresh_input_per_active_hour']))}</dd><small>Pi</small></div>
+            <div><dt>Total/hr win</dt><dd>{h(total_cmp['winner'])}</dd><small>{h(total_cmp['delta'])}</small></div>
+            <div><dt>Cost/hr win</dt><dd>{h(cost_cmp['winner'])}</dd><small>{h(cost_cmp['delta'])}</small></div>
+            <div><dt>Cache ratio win</dt><dd>{h(cache_cmp['winner'])}</dd><small>{h(cache_cmp['delta'])}</small></div>
+            <div><dt>Models</dt><dd>{h(', '.join(sorted(item['model_filter'])))}</dd><small>shared GPT only</small></div>
+          </div>
+          <ul class="warning-list">{warnings}</ul>
+        </article>""")
+    return f'<section class="model-section"><header><h2>Extra source slices vs Pi</h2></header><div class="model-grid">{"".join(cards)}</div></section>'
+
+
 def render_compare_html(
     repo: str | None,
     model_filter: set[str],
@@ -1441,6 +1843,7 @@ def render_compare_html(
     fairness: list[str],
     codex_filtered: list[SessionRecord],
     pi_filtered: list[SessionRecord],
+    extra_slices: list[dict[str, Any]],
 ) -> str:
     board_html, rows = html_compare_table(codex_agg, pi_agg)
     lead_tiles = "".join([
@@ -1517,6 +1920,9 @@ dd {{ margin:2px 0 0; color:var(--ink); font-weight:800; font-variant-numeric:ta
 .token-ledger {{ grid-template-columns:repeat(6,minmax(0,1fr)); }}
 .board-panel, .probe-panel, .model-section, .repo-panel, .warnings-panel {{ margin-top:24px; border:1px solid var(--line); background:var(--surface); }}
 .board-panel header, .probe-panel header, .model-section header, .repo-panel header, .warnings-panel header {{ padding:20px 22px; border-bottom:1px solid var(--line); }}
+.diagnosis-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--line); border-top:1px solid var(--line); }}
+.diagnosis-grid section {{ background:var(--surface-2); padding:18px 22px; }}
+.diagnosis-grid ul {{ margin:10px 0 0; padding-left:18px; color:var(--muted); }}
 h2, h3 {{ margin:0; }}
 .board-panel p, .probe-panel p, .repo-panel p {{ margin:5px 0 0; color:var(--muted); }}
 table {{ width:100%; border-collapse:collapse; }}
@@ -1544,6 +1950,11 @@ td b {{ color:var(--ink); }}
 .model-duo {{ display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--line); }}
 .model-duo div {{ padding:12px; background:oklch(0.145 0.010 258); }}
 .model-duo span {{ display:block; color:var(--muted); }}
+.mini-compare-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:1px; margin-top:12px; background:var(--line); }}
+.mini-compare-grid div {{ min-width:0; padding:12px; background:oklch(0.145 0.010 258); }}
+.mini-compare-grid small {{ display:block; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+.warning-list {{ list-style:none; margin:0; padding:0; }}
+.warning-list li {{ padding:10px 12px; border-top:1px solid var(--line); color:var(--muted); }}
 .model-strip {{ height:8px; margin:12px 0; }}
 .model-card dl {{ display:grid; grid-template-columns:1fr; gap:1px; margin:0; background:var(--line); }}
 .repo-panel li {{ grid-template-columns:minmax(0,1fr) 120px 120px 180px; }}
@@ -1552,7 +1963,7 @@ td b {{ color:var(--ink); }}
 .empty, .empty-panel {{ color:var(--soft); padding:18px 22px; }}
 .legend {{ display:flex; gap:14px; flex-wrap:wrap; margin-top:12px; color:var(--muted); }}
 .legend i {{ display:inline-block; width:10px; height:10px; margin-right:6px; }}
-@media (max-width: 980px) {{ .hero, .agent-grid {{ grid-template-columns:1fr; }} .verdict-grid {{ grid-template-columns:1fr; }} .token-ledger {{ grid-template-columns:repeat(3,1fr); }} }}
+@media (max-width: 980px) {{ .hero, .agent-grid, .diagnosis-grid {{ grid-template-columns:1fr; }} .verdict-grid {{ grid-template-columns:1fr; }} .token-ledger {{ grid-template-columns:repeat(3,1fr); }} }}
 @media (max-width: 680px) {{ .shell {{ width:min(100% - 20px, 1320px); padding-top:10px; }} h1 {{ font-size:2rem; }} .agent-kpis, .token-ledger, .verdict-card dl {{ grid-template-columns:1fr; }} th,td {{ padding:10px 8px; }} .repo-panel li, .injector-list li {{ grid-template-columns:1fr; }} }}
 </style>
 </head>
@@ -1578,7 +1989,9 @@ td b {{ color:var(--ink); }}
   <section class="verdict-grid">{lead_tiles}</section>
   <section class="agent-grid">{html_agent_panel('Codex', codex_agg)}{html_agent_panel('Pi', pi_agg)}</section>
   {board_html}
+  {html_quota_diagnosis_panel(codex_agg, pi_agg, fairness)}
   {html_probe_panel(codex_agg, pi_agg)}
+  {html_extra_source_slices(extra_slices)}
   <section class="model-section"><header><h2>Per matching model</h2></header><div class="model-grid">{model_cards}</div></section>
   {html_repo_slices(codex_filtered, pi_filtered, model_filter, repo)}
   <section class="warnings-panel"><header><h2>Fairness warnings</h2></header><ul>{warnings}</ul></section>
@@ -1614,6 +2027,7 @@ def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--codex-root", default=str(Path.home() / ".codex" / "sessions"))
     common.add_argument("--pi-root", default=str((Path.home() / ".pi").resolve() / "agent" / "sessions"))
+    common.add_argument("--opencode-root", default=str(OPENCODE_DB))
     common.add_argument("--repo", help="repo filter like GramGrab or scripts")
     common.add_argument("--pricing-file", help="optional JSON pricing override")
     common.add_argument("--models", help="comma-separated model allowlist")
@@ -1652,6 +2066,7 @@ def main() -> int:
 
     codex_root = Path(args.codex_root).expanduser().resolve()
     pi_root = Path(args.pi_root).expanduser().resolve()
+    opencode_root = Path(args.opencode_root).expanduser().resolve()
 
     if getattr(args, "debug_schema", False) or args.cmd == "debug-schema":
         debug_schema_samples(codex_root, pi_root)
@@ -1661,8 +2076,10 @@ def main() -> int:
     pricing = load_pricing(getattr(args, "pricing_file", None))
     codex_sessions = CodexParser(codex_root).parse_all()
     pi_sessions = PiParser(pi_root).parse_all()
+    opencode_sessions = OpencodeParser(opencode_root).parse_all()
     apply_costs(codex_sessions, pricing)
     apply_costs(pi_sessions, pricing)
+    apply_costs(opencode_sessions, pricing)
 
     repo = normalize_repo(args.repo) if getattr(args, "repo", None) else None
     model_allow = set(m.strip() for m in (args.models or "").split(",") if m.strip()) if getattr(args, "models", None) else None
@@ -1690,6 +2107,13 @@ def main() -> int:
     if args.pi_last_active_days:
         pi_filtered, pi_window = last_n_active_days([s for s in pi_filtered if not repo or s.repo == repo], args.pi_last_active_days)
 
+    opencode_window = codex_window
+    opencode_filtered = filter_by_window(opencode_sessions, opencode_window)
+    if args.last_active_days:
+        opencode_filtered, opencode_window = last_n_active_days([s for s in opencode_filtered if not repo or s.repo == repo], args.last_active_days)
+    if args.codex_last_active_days:
+        opencode_filtered, opencode_window = last_n_active_days([s for s in opencode_filtered if not repo or s.repo == repo], args.codex_last_active_days)
+
     baseline_payload = None
     if args.baseline:
         baseline_payload = json.loads(Path(args.baseline).expanduser().read_text())
@@ -1704,6 +2128,14 @@ def main() -> int:
 
     fairness = fairness_warnings(codex_agg, pi_agg, codex_agg.model_counts, pi_agg.model_counts, repo)
     matched_models = sorted(set(codex_by_model) & set(pi_by_model) & model_filter)
+    extra_slices = [
+        s for s in [
+            source_slice("Codex via T3 Code", [x for x in codex_filtered if x.originator == "t3code_desktop"], pi_filtered, repo, model_allow),
+            source_slice("opencode", opencode_filtered, pi_filtered, repo, model_allow),
+            source_slice("opencode via T3 Code", [x for x in opencode_filtered if x.originator == "t3code_desktop"], pi_filtered, repo, model_allow),
+        ]
+        if s
+    ]
 
     if args.json:
         print(json.dumps({
@@ -1715,6 +2147,17 @@ def main() -> int:
             "pi": serialize_aggregate(pi_agg),
             "matched_models": matched_models,
             "fairness_warnings": fairness,
+            "quota_burn_diagnosis": diagnosis_payload(codex_agg, pi_agg, fairness),
+            "extra_source_slices": [
+                {
+                    "name": s["name"],
+                    "model_filter": sorted(s["model_filter"]),
+                    "left": serialize_aggregate(s["left"]),
+                    "right": serialize_aggregate(s["right"]),
+                    "fairness_warnings": s["fairness"],
+                }
+                for s in extra_slices
+            ],
         }, indent=2))
         return 0
 
@@ -1733,6 +2176,7 @@ def main() -> int:
             fairness,
             codex_filtered,
             pi_filtered,
+            extra_slices,
         )
         write_or_open_html(doc, args.html)
         return 0
@@ -1757,6 +2201,11 @@ def main() -> int:
     print()
     print_diagnostic_box("context waste probes", codex_agg, pi_agg)
     print()
+    print_quota_burn_diagnosis(codex_agg, pi_agg, fairness)
+    print()
+    print_extra_source_slices(extra_slices)
+    if extra_slices:
+        print()
 
     print(c("2) Per matching model comparison", "bold", "white"))
     if not matched_models:
@@ -1779,7 +2228,7 @@ def main() -> int:
             continue
         cmr = metrics(ca)
         pmr = metrics(pa)
-        repo_lines.append(f"{pad(r, 18)} C {fmt_decimal(cmr['fresh_input_per_active_hour'])}/h  P {fmt_decimal(pmr['fresh_input_per_active_hour'])}/h  cache {fmt_pct(cmr['cache_ratio'])} → {fmt_pct(pmr['cache_ratio'])}")
+        repo_lines.append(f"{pad(r, 18)} C {compact_number(cmr['fresh_input_per_active_hour'])}/h  P {compact_number(pmr['fresh_input_per_active_hour'])}/h  cache {fmt_pct(cmr['cache_ratio'])} → {fmt_pct(pmr['cache_ratio'])}")
     if repo_lines:
         for line in boxed_lines("repo slices", repo_lines, "bright_magenta"):
             print(line)

@@ -13,6 +13,7 @@ usage() {
 Usage: agent-usage [--claude] [--scope today|7d|30d] [--html [FILE]]
 
 Options:
+  (default)       Include Codex, opencode, and Pi usage from local stores
   --claude       Include Claude Code usage from ~/.claude/projects
   --scope SCOPE  Use a range without prompting: today, 7d, 30d
   --html [FILE]  Write a standalone HTML report. Omit FILE to open a temp report.
@@ -91,6 +92,7 @@ import datetime as dt
 import json
 import os
 import re
+import sqlite3
 import sys
 import urllib.request
 from html import escape
@@ -107,6 +109,8 @@ NOW = dt.datetime.now().astimezone()
 TODAY = NOW.date()
 
 CODEX_DIR = HOME / ".codex" / "sessions"
+OPENCODE_DIR = HOME / ".local" / "share" / "opencode"
+OPENCODE_DB = OPENCODE_DIR / "opencode.db"
 CLAUDE_DIR = HOME / ".claude" / "projects"
 PI_LINK = HOME / ".pi"
 PI_HOME = PI_LINK.resolve() if PI_LINK.exists() else PI_LINK
@@ -172,6 +176,22 @@ def parse_ts(value: str) -> dt.datetime | None:
         return None
 
 
+def parse_epoch_ms(value) -> dt.datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        raw = float(value)
+    except (TypeError, ValueError):
+        return None
+    if raw <= 0:
+        return None
+    seconds = raw / 1000 if raw > 10_000_000_000 else raw
+    try:
+        return dt.datetime.fromtimestamp(seconds).astimezone()
+    except Exception:
+        return None
+
+
 def scope_start(scope: str) -> dt.datetime:
     if scope == "today":
         return NOW.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -220,11 +240,22 @@ def iter_jsonl_files(root: Path):
     return sorted(root.rglob("*.jsonl"))
 
 
+def active_seconds(events: list[dt.datetime]) -> int:
+    events = sorted(events)
+    active = 0
+    for prev, cur in zip(events, events[1:]):
+        delta = int((cur - prev).total_seconds())
+        if delta > 0:
+            active += min(delta, ACTIVE_GAP_SECONDS)
+    return active or 60
+
+
 def codex_session_stats(path: Path):
     session_id = None
     cwd = None
+    originator = None
     events: list[dt.datetime] = []
-    token_total = {"input": 0, "cached": 0, "output": 0, "reasoning": 0, "total": 0}
+    token_total = {"input": 0, "cached": 0, "cache_write": 0, "output": 0, "reasoning": 0, "total": 0}
     langs: Counter[str] = Counter()
     model_counts: Counter[str] = Counter()
     effort_counts: Counter[str] = Counter()
@@ -250,6 +281,7 @@ def codex_session_stats(path: Path):
                     payload = {}
                 session_id = payload.get("id")
                 cwd = payload.get("cwd")
+                originator = payload.get("originator")
             payload = item.get("payload") or {}
             if not isinstance(payload, dict):
                 payload = {}
@@ -274,12 +306,14 @@ def codex_session_stats(path: Path):
                 info = info.get("total_token_usage") or {}
                 if not isinstance(info, dict):
                     info = {}
-                input_tokens = int(info.get("input_tokens", 0) or 0)
+                raw_input_tokens = int(info.get("input_tokens", 0) or 0)
                 cached_tokens = int(info.get("cached_input_tokens", 0) or 0)
+                input_tokens = max(raw_input_tokens - cached_tokens, 0)
                 output_tokens = int(info.get("output_tokens", 0) or 0)
                 token_total = {
                     "input": input_tokens,
                     "cached": cached_tokens,
+                    "cache_write": 0,
                     "output": output_tokens,
                     "reasoning": int(info.get("reasoning_output_tokens", 0) or 0),
                     "total": input_tokens + cached_tokens + output_tokens,
@@ -304,15 +338,18 @@ def codex_session_stats(path: Path):
             model_tokens[model_name] = {
                 "input": int(token_total.get("input", 0) * ratio),
                 "cached": int(token_total.get("cached", 0) * ratio),
+                "cache_write": int(token_total.get("cache_write", 0) * ratio),
                 "output": int(token_total.get("output", 0) * ratio),
                 "total": int(token_total.get("total", 0) * ratio),
             }
 
     return {
         "source": "codex",
+        "source_label": "T3 Code" if originator == "t3code_desktop" else "Codex",
         "session_id": session_id or path.stem,
         "cwd": cwd,
         "repo": repo_name(cwd),
+        "originator": originator or "unknown",
         "start": events[0],
         "end": events[-1],
         "active_seconds": active,
@@ -329,11 +366,11 @@ def pi_session_stats(path: Path):
     session_id = None
     cwd = None
     events: list[dt.datetime] = []
-    tokens = {"input": 0, "cached": 0, "output": 0, "reasoning": 0, "total": 0}
+    tokens = {"input": 0, "cached": 0, "cache_write": 0, "output": 0, "reasoning": 0, "total": 0}
     langs: Counter[str] = Counter()
     model_counts: Counter[str] = Counter()
     effort_counts: Counter[str] = Counter()
-    model_tokens: dict[str, dict[str, int]] = defaultdict(lambda: {"input": 0, "cached": 0, "output": 0, "total": 0})
+    model_tokens: dict[str, dict[str, int]] = defaultdict(lambda: {"input": 0, "cached": 0, "cache_write": 0, "output": 0, "total": 0})
 
     with path.open() as f:
         for line in f:
@@ -371,16 +408,26 @@ def pi_session_stats(path: Path):
                 usage = message.get("usage") or {}
                 if not isinstance(usage, dict):
                     usage = {}
+                input_tokens = int(usage.get("input", 0) or 0)
+                cached_tokens = int(usage.get("cacheRead", 0) or 0)
+                cache_write_tokens = int(usage.get("cacheWrite", 0) or 0)
+                output_tokens = int(usage.get("output", 0) or 0)
+                total_tokens = int(
+                    usage.get("totalTokens", 0)
+                    or input_tokens + cached_tokens + cache_write_tokens + output_tokens
+                )
                 if model_name:
                     bucket = model_tokens[str(model_name)]
-                    bucket["input"] += int(usage.get("input", 0) or 0)
-                    bucket["cached"] += int(usage.get("cacheRead", 0) or 0)
-                    bucket["output"] += int(usage.get("output", 0) or 0)
-                    bucket["total"] += int(usage.get("totalTokens", 0) or 0)
-                tokens["input"] += int(usage.get("input", 0) or 0)
-                tokens["cached"] += int(usage.get("cacheRead", 0) or 0)
-                tokens["output"] += int(usage.get("output", 0) or 0)
-                tokens["total"] += int(usage.get("totalTokens", 0) or 0)
+                    bucket["input"] += input_tokens
+                    bucket["cached"] += cached_tokens
+                    bucket["cache_write"] += cache_write_tokens
+                    bucket["output"] += output_tokens
+                    bucket["total"] += total_tokens
+                tokens["input"] += input_tokens
+                tokens["cached"] += cached_tokens
+                tokens["cache_write"] += cache_write_tokens
+                tokens["output"] += output_tokens
+                tokens["total"] += total_tokens
 
     if not events:
         return None
@@ -410,15 +457,204 @@ def pi_session_stats(path: Path):
     }
 
 
+def is_t3code_opencode_session(title, metadata) -> bool:
+    title_text = str(title or "").strip()
+    if re.search(r"^T3 Code(?:\s|$)", title_text, re.IGNORECASE):
+        return True
+    return "t3code" in str(metadata or "").lower()
+
+
+def opencode_sessions():
+    if not OPENCODE_DB.exists():
+        return []
+
+    try:
+        conn = sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return []
+
+    try:
+        session_rows = conn.execute(
+            """
+            select id, directory, title, time_created, time_updated, model, metadata,
+                   tokens_input, tokens_output, tokens_reasoning,
+                   tokens_cache_read, tokens_cache_write
+            from session
+            """
+        ).fetchall()
+        message_rows = conn.execute(
+            """
+            select session_id, time_created, time_updated, data
+            from message
+            order by session_id, time_created, id
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        conn.close()
+        return []
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+    grouped_messages: defaultdict[str, list[sqlite3.Row]] = defaultdict(list)
+    for row in message_rows:
+        grouped_messages[str(row["session_id"])].append(row)
+
+    sessions = []
+    for row in session_rows:
+        session_id = str(row["id"])
+        cwd = row["directory"]
+        events = []
+        tokens = {"input": 0, "cached": 0, "cache_write": 0, "output": 0, "reasoning": 0, "total": 0}
+        langs: Counter[str] = Counter()
+        model_counts: Counter[str] = Counter()
+        effort_counts: Counter[str] = Counter()
+        model_tokens: dict[str, dict[str, int]] = defaultdict(lambda: {"input": 0, "cached": 0, "cache_write": 0, "output": 0, "total": 0})
+
+        for raw_ts in (row["time_created"], row["time_updated"]):
+            ts = parse_epoch_ms(raw_ts)
+            if ts:
+                events.append(ts)
+
+        originator = "t3code_desktop" if is_t3code_opencode_session(row["title"], row["metadata"]) else "opencode"
+        fallback_model = None
+        try:
+            model_info = json.loads(row["model"] or "{}")
+        except Exception:
+            model_info = {}
+        if isinstance(model_info, dict):
+            fallback_model = model_info.get("id")
+            variant = model_info.get("variant")
+            if variant:
+                effort_counts[str(variant)] += 1
+
+        if row["title"]:
+            langs.update(infer_languages(str(row["title"])))
+
+        diff_path = OPENCODE_DIR / "storage" / "session_diff" / f"{session_id}.json"
+        if diff_path.exists():
+            try:
+                langs.update(infer_languages(diff_path.read_text(encoding="utf-8", errors="ignore")))
+            except OSError:
+                pass
+
+        for message in grouped_messages.get(session_id, []):
+            for raw_ts in (message["time_created"], message["time_updated"]):
+                ts = parse_epoch_ms(raw_ts)
+                if ts:
+                    events.append(ts)
+            raw_data = message["data"] or ""
+            langs.update(infer_languages(raw_data))
+            try:
+                data = json.loads(raw_data)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            time_info = data.get("time") or {}
+            if isinstance(time_info, dict):
+                for raw_ts in (time_info.get("created"), time_info.get("completed")):
+                    ts = parse_epoch_ms(raw_ts)
+                    if ts:
+                        events.append(ts)
+            path_info = data.get("path") or {}
+            if isinstance(path_info, dict):
+                cwd = cwd or path_info.get("cwd") or path_info.get("root")
+            variant = data.get("variant")
+            if variant:
+                effort_counts[str(variant)] += 1
+            if data.get("role") != "assistant":
+                continue
+            model_name = data.get("modelID") or fallback_model
+            if model_name:
+                model_name = str(model_name)
+                model_counts[model_name] += 1
+            usage = data.get("tokens") or {}
+            if not isinstance(usage, dict):
+                usage = {}
+            cache = usage.get("cache") or {}
+            if not isinstance(cache, dict):
+                cache = {}
+            input_tokens = int(usage.get("input", 0) or 0)
+            cached_tokens = int(cache.get("read", 0) or 0)
+            cache_write_tokens = int(cache.get("write", 0) or 0)
+            output_tokens = int(usage.get("output", 0) or 0)
+            reasoning_tokens = int(usage.get("reasoning", 0) or 0)
+            total_tokens = int(
+                usage.get("total", 0)
+                or input_tokens + cached_tokens + cache_write_tokens + output_tokens
+            )
+            tokens["input"] += input_tokens
+            tokens["cached"] += cached_tokens
+            tokens["cache_write"] += cache_write_tokens
+            tokens["output"] += output_tokens
+            tokens["reasoning"] += reasoning_tokens
+            tokens["total"] += total_tokens
+            if model_name:
+                bucket = model_tokens[model_name]
+                bucket["input"] += input_tokens
+                bucket["cached"] += cached_tokens
+                bucket["cache_write"] += cache_write_tokens
+                bucket["output"] += output_tokens
+                bucket["total"] += total_tokens
+
+        if not events:
+            continue
+
+        if tokens["total"] == 0:
+            tokens = {
+                "input": int(row["tokens_input"] or 0),
+                "cached": int(row["tokens_cache_read"] or 0),
+                "cache_write": int(row["tokens_cache_write"] or 0),
+                "output": int(row["tokens_output"] or 0),
+                "reasoning": int(row["tokens_reasoning"] or 0),
+                "total": int(row["tokens_input"] or 0)
+                + int(row["tokens_cache_read"] or 0)
+                + int(row["tokens_cache_write"] or 0)
+                + int(row["tokens_output"] or 0),
+            }
+            if fallback_model:
+                model_counts[str(fallback_model)] += 1
+                model_tokens[str(fallback_model)] = {
+                    "input": tokens["input"],
+                    "cached": tokens["cached"],
+                    "cache_write": tokens["cache_write"],
+                    "output": tokens["output"],
+                    "total": tokens["total"],
+                }
+
+        sessions.append({
+            "source": "opencode",
+            "source_label": "T3 Code" if originator == "t3code_desktop" else "opencode",
+            "session_id": session_id,
+            "cwd": cwd,
+            "repo": repo_name(cwd),
+            "originator": originator,
+            "start": min(events),
+            "end": max(events),
+            "active_seconds": active_seconds(events),
+            "tokens": tokens,
+            "languages": langs,
+            "models": model_counts,
+            "efforts": effort_counts,
+            "model_tokens": dict(model_tokens),
+            "path": str(OPENCODE_DB),
+        })
+    return sessions
+
+
 def claude_session_stats(path: Path):
     session_id = None
     cwd = None
     events: list[dt.datetime] = []
-    tokens = {"input": 0, "cached": 0, "output": 0, "reasoning": 0, "total": 0}
+    tokens = {"input": 0, "cached": 0, "cache_write": 0, "output": 0, "reasoning": 0, "total": 0}
     langs: Counter[str] = Counter()
     model_counts: Counter[str] = Counter()
     effort_counts: Counter[str] = Counter()
-    model_tokens: dict[str, dict[str, int]] = defaultdict(lambda: {"input": 0, "cached": 0, "output": 0, "total": 0})
+    model_tokens: dict[str, dict[str, int]] = defaultdict(lambda: {"input": 0, "cached": 0, "cache_write": 0, "output": 0, "total": 0})
 
     with path.open() as f:
         for line in f:
@@ -452,6 +688,7 @@ def claude_session_stats(path: Path):
             if usage:
                 input_tokens = int(usage.get("input_tokens", 0) or 0)
                 cached_tokens = int(usage.get("cache_read_input_tokens", 0) or 0)
+                cache_write_tokens = int(usage.get("cache_creation_input_tokens", 0) or 0)
                 output_tokens = int(usage.get("output_tokens", 0) or 0)
                 reasoning_tokens = 0
                 iterations = usage.get("iterations")
@@ -462,10 +699,11 @@ def claude_session_stats(path: Path):
                         reasoning_tokens += int(iteration.get("output_tokens", 0) or 0)
                 total_tokens = int(
                     usage.get("total_tokens", 0)
-                    or input_tokens + cached_tokens + output_tokens
+                    or input_tokens + cached_tokens + cache_write_tokens + output_tokens
                 )
                 tokens["input"] += input_tokens
                 tokens["cached"] += cached_tokens
+                tokens["cache_write"] += cache_write_tokens
                 tokens["output"] += output_tokens
                 tokens["reasoning"] += reasoning_tokens
                 tokens["total"] += total_tokens
@@ -473,6 +711,7 @@ def claude_session_stats(path: Path):
                     bucket = model_tokens[str(model_name)]
                     bucket["input"] += input_tokens
                     bucket["cached"] += cached_tokens
+                    bucket["cache_write"] += cache_write_tokens
                     bucket["output"] += output_tokens
                     bucket["total"] += total_tokens
 
@@ -510,6 +749,7 @@ def collect_sessions():
         stat = codex_session_stats(path)
         if stat:
             sessions.append(stat)
+    sessions.extend(opencode_sessions())
     if INCLUDE_CLAUDE:
         for path in iter_jsonl_files(CLAUDE_DIR):
             stat = claude_session_stats(path)
@@ -622,6 +862,7 @@ def load_pricing_map():
             "prompt": pricing.get("prompt"),
             "completion": pricing.get("completion"),
             "cache_read": pricing.get("input_cache_read"),
+            "cache_write": pricing.get("input_cache_write"),
         }
     return out
 
@@ -643,16 +884,20 @@ def estimate_cost_breakdown_usd(model_name: str, token_info: dict, pricing_map: 
     prompt = as_decimal(pricing.get("prompt")) or Decimal("0")
     completion = as_decimal(pricing.get("completion")) or Decimal("0")
     cache_read = as_decimal(pricing.get("cache_read")) or Decimal("0")
+    cache_write = as_decimal(pricing.get("cache_write")) or prompt
     input_tokens = Decimal(token_info.get("input", 0) or 0)
     output_tokens = Decimal(token_info.get("output", 0) or 0)
     cached_tokens = Decimal(token_info.get("cached", 0) or 0)
+    cache_write_tokens = Decimal(token_info.get("cache_write", 0) or 0)
     input_cost = input_tokens * prompt
     cache_cost = cached_tokens * cache_read
+    cache_write_cost = cache_write_tokens * cache_write
     output_cost = output_tokens * completion
-    total_cost = input_cost + cache_cost + output_cost
+    total_cost = input_cost + cache_cost + cache_write_cost + output_cost
     return {
         "input": input_cost,
         "cached": cache_cost,
+        "cache_write": cache_write_cost,
         "output": output_cost,
         "total": total_cost,
     }
@@ -708,6 +953,8 @@ def model_rows(stats: dict, pricing_map: dict, limit: int = 5) -> list[tuple[str
         rows.append((
             model,
             f"{pct:.0f}% · in {compact_tokens(token_info.get('input', 0))} ({prompt_rate})"
+            f" · cached {compact_tokens(token_info.get('cached', 0))}"
+            f" · write {compact_tokens(token_info.get('cache_write', 0))}"
             f" · out {compact_tokens(token_info.get('output', 0))} ({completion_rate})"
             f" · est {usd(costs['total']) if costs else 'n/a'}",
             pct,
@@ -748,12 +995,12 @@ def aggregate(sessions):
     data = {
         "active_seconds": 0,
         "session_count": 0,
-        "tokens": {"input": 0, "cached": 0, "output": 0, "reasoning": 0, "total": 0},
+        "tokens": {"input": 0, "cached": 0, "cache_write": 0, "output": 0, "reasoning": 0, "total": 0},
         "repos": Counter(),
         "languages": Counter(),
         "efforts": Counter(),
         "model_usage": Counter(),
-        "model_tokens": defaultdict(lambda: {"input": 0, "cached": 0, "output": 0, "total": 0}),
+        "model_tokens": defaultdict(lambda: {"input": 0, "cached": 0, "cache_write": 0, "output": 0, "total": 0}),
         "days": defaultdict(lambda: {"active_seconds": 0, "session_count": 0}),
     }
     for session in sessions:
@@ -772,12 +1019,17 @@ def aggregate(sessions):
                 source_bucket = (session.get("model_tokens") or {}).get(model_name, {})
                 bucket["input"] += int(source_bucket.get("input", 0) or 0)
                 bucket["cached"] += int(source_bucket.get("cached", 0) or 0)
+                bucket["cache_write"] += int(source_bucket.get("cache_write", 0) or 0)
                 bucket["output"] += int(source_bucket.get("output", 0) or 0)
                 bucket["total"] += int(source_bucket.get("total", 0) or 0)
         day_key = session["start"].date().isoformat()
         data["days"][day_key]["active_seconds"] += session["active_seconds"]
         data["days"][day_key]["session_count"] += 1
     return data
+
+
+def session_label(session: dict) -> str:
+    return str(session.get("source_label") or session.get("source") or "unknown")
 
 
 def sorted_top(counter, limit=5):
@@ -801,8 +1053,9 @@ def print_banner(scope_title: str, combined_stats):
     print(
         f"  {dim('Legend:')} {color('Input', '95')} {dim('= input,')} "
         f"{color('Cached', '96')} {dim('= cache reads,')} "
+        f"{color('Cache write', '94')} {dim('= cache creation,')} "
         f"{color('Output', '93')} {dim('= output,')} "
-        f"{color('Total', '95')} {dim('= input + cached + output.')}"
+        f"{color('Total', '95')} {dim('= input + cached + cache write + output.')}"
     )
     print(f"  {dim('Bar meaning: within each card, longer bars mean larger token buckets for that source and time range.')}")
     print()
@@ -829,10 +1082,11 @@ def print_section(title, color_code, stats):
     print()
     print(f"  {color('Token intensity', color_code)}")
     print(f"    {dim('Scaled against Total tokens in this card.')}")
-    print(f"    {dim('Total here means input + cached + output, so large cache usage will dominate it.')}")
-    print(f"    {dim('Input '.ljust(8))} {bar(stats['tokens']['input'], token_total, color_code=color_code)} {color(compact_tokens(stats['tokens']['input']), '97')}")
-    print(f"    {dim('Cached'.ljust(8))} {bar(stats['tokens']['cached'], token_total, color_code='96')} {color(compact_tokens(stats['tokens']['cached']), '97')}")
-    print(f"    {dim('Output'.ljust(8))} {bar(stats['tokens']['output'], token_total, color_code='93')} {color(compact_tokens(stats['tokens']['output']), '97')}")
+    print(f"    {dim('Total here means input + cached + cache write + output.')}")
+    print(f"    {dim('Input '.ljust(11))} {bar(stats['tokens']['input'], token_total, color_code=color_code)} {color(compact_tokens(stats['tokens']['input']), '97')}")
+    print(f"    {dim('Cached'.ljust(11))} {bar(stats['tokens']['cached'], token_total, color_code='96')} {color(compact_tokens(stats['tokens']['cached']), '97')}")
+    print(f"    {dim('Cache write'.ljust(11))} {bar(stats['tokens'].get('cache_write', 0), token_total, color_code='94')} {color(compact_tokens(stats['tokens'].get('cache_write', 0)), '97')}")
+    print(f"    {dim('Output'.ljust(11))} {bar(stats['tokens']['output'], token_total, color_code='93')} {color(compact_tokens(stats['tokens']['output']), '97')}")
     print(f"    {dim('Total '.ljust(8))} {bar(stats['tokens']['total'], token_total, color_code='95')} {color(compact_tokens(stats['tokens']['total']), '1;97')}")
     print()
     for line in list_block("Top repos", top_repos, color_code):
@@ -958,6 +1212,8 @@ def html_models_panel(stats: dict, limit: int = 5) -> str:
               <div class="track"><i style="width:{max(2, min(100, pct)):.1f}%"></i></div>
               <dl class="model-metrics">
                 <div><dt>Input</dt><dd>{h(compact_tokens(token_info.get('input', 0)))}</dd><small>{h(prompt_rate)}</small></div>
+                <div><dt>Cached</dt><dd>{h(compact_tokens(token_info.get('cached', 0)))}</dd><small>cache read</small></div>
+                <div><dt>Write</dt><dd>{h(compact_tokens(token_info.get('cache_write', 0)))}</dd><small>cache create</small></div>
                 <div><dt>Output</dt><dd>{h(compact_tokens(token_info.get('output', 0)))}</dd><small>{h(completion_rate)}</small></div>
                 <div><dt>Est cost</dt><dd>{h(est_cost)}</dd><small>range total</small></div>
               </dl>
@@ -1018,9 +1274,10 @@ def html_source_section(title: str, stats: dict, tone: str) -> str:
       </header>
       <div class="token-panel" aria-label="Token intensity for {h(title)}">
         <h3>Token intensity</h3>
-        <p>Total means input plus cached plus output. Cache-heavy sessions will dominate the scale.</p>
+        <p>Total means input plus cached plus cache write plus output.</p>
         {html_token_bar('Input', stats['tokens']['input'], token_total, 'input')}
         {html_token_bar('Cached', stats['tokens']['cached'], token_total, 'cached')}
+        {html_token_bar('Cache write', stats['tokens'].get('cache_write', 0), token_total, 'cache-write')}
         {html_token_bar('Output', stats['tokens']['output'], token_total, 'output')}
         {html_token_bar('Total', stats['tokens']['total'], token_total, 'total')}
       </div>
@@ -1034,19 +1291,35 @@ def html_source_section(title: str, stats: dict, tone: str) -> str:
     </section>"""
 
 
-def render_html_document(scope_title: str, combined_stats: dict, codex_stats: dict, claude_stats: dict, pi_stats: dict) -> str:
+def render_html_document(
+    scope_title: str,
+    combined_stats: dict,
+    codex_stats: dict,
+    t3code_stats: dict,
+    codex_other_stats: dict,
+    opencode_stats: dict,
+    opencode_t3code_stats: dict,
+    opencode_other_stats: dict,
+    claude_stats: dict,
+    pi_stats: dict,
+) -> str:
     combined_cost = estimate_stats_total_cost(combined_stats, PRICING_MAP)
     generated = NOW.strftime("%b %d, %Y · %I:%M %p")
-    source_count = 2 + (1 if INCLUDE_CLAUDE else 0)
+    source_count = 3 + (1 if INCLUDE_CLAUDE else 0)
     sections = [
         html_source_section("Combined", combined_stats, "oklch(0.681 0.132 258.4)"),
         html_source_section("Codex", codex_stats, "oklch(0.68 0.13 258)"),
+        html_source_section("Codex via T3 Code", t3code_stats, "oklch(0.78 0.16 38)"),
+        html_source_section("Codex other", codex_other_stats, "oklch(0.64 0.08 205)"),
+        html_source_section("opencode", opencode_stats, "oklch(0.72 0.16 305)"),
+        html_source_section("opencode via T3 Code", opencode_t3code_stats, "oklch(0.78 0.16 38)"),
+        html_source_section("opencode other", opencode_other_stats, "oklch(0.64 0.08 305)"),
     ]
     if INCLUDE_CLAUDE:
         sections.append(html_source_section("Claude Code", claude_stats, "oklch(0.70 0.13 35)"))
     sections.append(html_source_section("Pi", pi_stats, "oklch(0.74 0.14 150)"))
     no_data = "" if combined_stats["session_count"] else "<p class=\"notice\">No sessions found in this range.</p>"
-    sources_note = "Codex: ~/.codex/sessions · Pi: ~/.pi/agent/sessions"
+    sources_note = "Codex: ~/.codex/sessions · opencode: ~/.local/share/opencode/opencode.db · Pi: ~/.pi/agent/sessions"
     if INCLUDE_CLAUDE:
         sources_note += " · Claude Code: ~/.claude/projects"
     return f"""<!doctype html>
@@ -1143,7 +1416,7 @@ h1 {{ margin: 0; font-size: 2.75rem; line-height: 1.02; letter-spacing: -0.025em
 .model-panel {{ background: color-mix(in oklch, var(--surface-2), var(--tone) 5%); }}
 .model-list .track {{ height: 7px; margin-bottom: 10px; }}
 .model-list .track i {{ background: var(--tone); }}
-.model-metrics {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; margin: 0; background: oklch(0.30 0.018 258); }}
+.model-metrics {{ display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 1px; margin: 0; background: oklch(0.30 0.018 258); }}
 .model-metrics div {{ min-width: 0; padding: 9px 10px; background: oklch(0.145 0.010 258); }}
 .model-metrics dt {{ margin: 0; color: var(--soft); font-size: 0.72rem; }}
 .model-metrics dd {{ margin: 2px 0 0; color: var(--ink); font-weight: 850; font-variant-numeric: tabular-nums; }}
@@ -1184,7 +1457,7 @@ h1 {{ margin: 0; font-size: 2.75rem; line-height: 1.02; letter-spacing: -0.025em
       <div>
         <p class="kicker">Local usage dossier</p>
         <h1>Agent usage report</h1>
-        <p class="hero-copy">A standalone HTML readout for local Codex, Pi, and optional Claude Code session history. Built for quick audit: time, tokens, model mix, costs, repositories, languages, and recent activity.</p>
+        <p class="hero-copy">A standalone HTML readout for local Codex, opencode, Pi, and optional Claude Code session history. Built for quick audit: time, tokens, model mix, costs, repositories, languages, and recent activity.</p>
       </div>
       <aside class="hero-aside" aria-label="Report context">
         <p>Range <b>{h(scope_title)}</b></p>
@@ -1195,7 +1468,7 @@ h1 {{ margin: 0; font-size: 2.75rem; line-height: 1.02; letter-spacing: -0.025em
     <dl class="summary-grid" aria-label="Combined summary">
       {html_metric('Active time', human_seconds(combined_stats['active_seconds']))}
       {html_metric('Sessions', str(combined_stats['session_count']))}
-      {html_metric('Tokens', compact_tokens(combined_stats['tokens']['total']), 'input + cached + output')}
+      {html_metric('Tokens', compact_tokens(combined_stats['tokens']['total']), 'input + cached + cache write + output')}
       {html_metric('Estimated cost', usd(combined_cost), 'models.dev rate card when available')}
     </dl>
     {no_data}
@@ -1203,6 +1476,7 @@ h1 {{ margin: 0; font-size: 2.75rem; line-height: 1.02; letter-spacing: -0.025em
     {''.join(sections)}
     <footer class="report-foot">
       <p><strong>Data sources:</strong> {h(sources_note)}</p>
+      <p>T3 Code sessions are detected from Codex session metadata: <code>originator=t3code_desktop</code>, and from opencode session titles beginning <code>T3 Code</code>.</p>
       <p>Cost is an estimate. Missing pricing data appears as n/a. This file is self-contained and reads no network resources.</p>
     </footer>
   </main>
@@ -1211,8 +1485,30 @@ h1 {{ margin: 0; font-size: 2.75rem; line-height: 1.02; letter-spacing: -0.025em
 """
 
 
-def emit_html_report(scope_title: str, combined_stats: dict, codex_stats: dict, claude_stats: dict, pi_stats: dict) -> None:
-    doc = render_html_document(scope_title, combined_stats, codex_stats, claude_stats, pi_stats)
+def emit_html_report(
+    scope_title: str,
+    combined_stats: dict,
+    codex_stats: dict,
+    t3code_stats: dict,
+    codex_other_stats: dict,
+    opencode_stats: dict,
+    opencode_t3code_stats: dict,
+    opencode_other_stats: dict,
+    claude_stats: dict,
+    pi_stats: dict,
+) -> None:
+    doc = render_html_document(
+        scope_title,
+        combined_stats,
+        codex_stats,
+        t3code_stats,
+        codex_other_stats,
+        opencode_stats,
+        opencode_t3code_stats,
+        opencode_other_stats,
+        claude_stats,
+        pi_stats,
+    )
     if OUTPUT_PATH == "-":
         print(doc)
         return
@@ -1229,10 +1525,20 @@ PRICING_MAP = load_pricing_map()
 start = scope_start(SCOPE)
 filtered = filter_sessions(all_sessions, start)
 codex_sessions = [s for s in filtered if s["source"] == "codex"]
+t3code_sessions = [s for s in codex_sessions if s.get("originator") == "t3code_desktop"]
+codex_other_sessions = [s for s in codex_sessions if s.get("originator") != "t3code_desktop"]
 claude_sessions = [s for s in filtered if s["source"] == "claude"]
+opencode_sessions_filtered = [s for s in filtered if s["source"] == "opencode"]
+opencode_t3code_sessions = [s for s in opencode_sessions_filtered if s.get("originator") == "t3code_desktop"]
+opencode_other_sessions = [s for s in opencode_sessions_filtered if s.get("originator") != "t3code_desktop"]
 pi_sessions = [s for s in filtered if s["source"] == "pi"]
 combined = aggregate(filtered)
 codex = aggregate(codex_sessions)
+t3code = aggregate(t3code_sessions)
+codex_other = aggregate(codex_other_sessions)
+opencode = aggregate(opencode_sessions_filtered)
+opencode_t3code = aggregate(opencode_t3code_sessions)
+opencode_other = aggregate(opencode_other_sessions)
 claude = aggregate(claude_sessions)
 pi = aggregate(pi_sessions)
 
@@ -1243,11 +1549,16 @@ scope_title = {
 }[SCOPE]
 
 if OUTPUT_MODE == "html":
-    emit_html_report(scope_title, combined, codex, claude, pi)
+    emit_html_report(scope_title, combined, codex, t3code, codex_other, opencode, opencode_t3code, opencode_other, claude, pi)
 else:
     print_banner(scope_title, combined)
     print_section("Combined", "95", combined)
     print_section("Codex", "94", codex)
+    print_section("Codex via T3 Code", "33", t3code)
+    print_section("Codex other", "36", codex_other)
+    print_section("opencode", "95", opencode)
+    print_section("opencode via T3 Code", "33", opencode_t3code)
+    print_section("opencode other", "36", opencode_other)
     if INCLUDE_CLAUDE:
         print_section("Claude Code", "35", claude)
     print_section("Pi", "92", pi)
@@ -1256,12 +1567,12 @@ else:
     if filtered:
         longest = max(filtered, key=lambda s: s["active_seconds"])
         print(
-            f"  {color('Longest active', '93')}  {bold(longest['source'])} {dim('·')} "
+            f"  {color('Longest active', '93')}  {bold(session_label(longest))} {dim('·')} "
             f"{color(human_seconds(longest['active_seconds']), '1;97')} {dim('·')} {color(longest['repo'], '96')}"
         )
         latest = max(filtered, key=lambda s: s["end"])
         print(
-            f"  {color('Latest session', '95')}  {bold(latest['source'])} {dim('·')} "
+            f"  {color('Latest session', '95')}  {bold(session_label(latest))} {dim('·')} "
             f"{color(latest['end'].strftime('%b %d %I:%M %p'), '1;97')} {dim('·')} {color(latest['repo'], '96')}"
         )
     else:
@@ -1274,6 +1585,8 @@ show_sources() {
   gum style --foreground 212 --bold "Session stores found locally"
   printf "\n"
   gum style --foreground 99 "Codex" && printf "  ~/.codex/sessions and ~/.codex/history.jsonl\n"
+  gum style --foreground 214 "T3 Code" && printf "  detected inside Codex meta (originator=t3code_desktop) and opencode titles (T3 Code*)\n"
+  gum style --foreground 213 "opencode" && printf "  ~/.local/share/opencode/opencode.db\n"
   if [[ "$include_claude" == "1" ]]; then
     gum style --foreground 35 "Claude Code" && printf "  ~/.claude/projects\n"
   fi
