@@ -323,10 +323,11 @@ print_window() {
   echo
 }
 
-clear
+printf '\n'
 echo "${BOLD}${BRIGHT_CYAN}╔══════════════════════════════╗${RESET}"
 echo "${BOLD}${BRIGHT_CYAN}║        CODEX  USAGE          ║${RESET}"
 echo "${BOLD}${BRIGHT_CYAN}╚══════════════════════════════╝${RESET}"
+echo "  ${DIM}$(date '+%a, %d %b %Y %I:%M %p')${RESET}"
 echo
 
 if [[ "$LIMIT_REACHED" == "true" || "$ALLOWED" == "false" ]]; then
