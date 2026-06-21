@@ -6,6 +6,9 @@ APPIMAGE_DIR="$HOME/.local/bin/appimages"
 DESKTOP_DB="$HOME/.local/share/applications"
 ICON_SOURCE="$HOME/.local/share/icons/t3code.png"
 ICON_URL="https://github.com/pingdotgg/t3code/raw/main/assets/prod/black-universal-1024.png"
+FALLBACK_VERSION=""
+FALLBACK_ALREADY_INSTALLED="false"
+FALLBACK_STATUS=""
 
 choice=$(gum choose --header "Select version to install:" "Stable" "Nightly") || exit 1
 
@@ -109,12 +112,24 @@ save_installed_version() {
     echo "$version" > "$APP_DIR/.version"
 }
 
+get_releases() {
+    gh api repos/$REPO/releases
+}
+
+release_filter() {
+    if [[ "$VARIANT" == "nightly" ]]; then
+        echo '.[] | select(.draft == false and (.tag_name | test("nightly"))) | .tag_name'
+    else
+        echo '.[] | select(.draft == false and (.tag_name | test("nightly") | not)) | .tag_name'
+    fi
+}
+
 get_latest_version() {
-    gh api repos/$REPO/releases | jq -r ".[] | select(.prerelease == $PRERELEASE) | .tag_name" | head -1
+    get_releases | jq -r "$(release_filter)" | head -1
 }
 
 get_versions() {
-    gh api repos/$REPO/releases | jq -r ".[] | select(.prerelease == $PRERELEASE) | .tag_name"
+    get_releases | jq -r "$(release_filter)"
 }
 
 select_version() {
@@ -141,6 +156,51 @@ show_changelog() {
         gum log --level warn "No release notes available for ${version}."
     fi
     echo ""
+}
+
+fallback_to_nightly_if_needed() {
+    if [[ "$VARIANT" != "stable" ]]; then
+        FALLBACK_STATUS="not-applicable"
+        return 1
+    fi
+
+    local nightly_version=""
+    nightly_version=$(get_releases | jq -r '.[] | select(.draft == false and (.tag_name | test("nightly"))) | .tag_name' | head -1)
+
+    gum log --level warn "No stable GitHub release exists upstream right now."
+
+    if [[ -z "$nightly_version" ]]; then
+        gum log --level error "No nightly release found either."
+        FALLBACK_STATUS="missing"
+        return 1
+    fi
+
+    VARIANT="nightly"
+    APP_DIR="$APPIMAGE_DIR/t3code-nightly"
+    DESKTOP_ENTRY="$HOME/.local/share/applications/t3code-nightly.desktop"
+    APPIMAGE_NAME="t3code-nightly.AppImage"
+    DESKTOP_APP_NAME="T3 Code (Nightly)"
+    STARTUP_WM_CLASS="t3 code (nightly)"
+    PRERELEASE="true"
+
+    FALLBACK_VERSION="$nightly_version"
+
+    local installed_version=""
+    installed_version=$(get_installed_version)
+    if [[ -n "$installed_version" && "$installed_version" == "$nightly_version" ]]; then
+        FALLBACK_ALREADY_INSTALLED="true"
+        FALLBACK_STATUS="already-installed"
+        return 0
+    fi
+
+    gum log --level info "Latest nightly version: $nightly_version"
+    if ! gum confirm "Install nightly instead?"; then
+        FALLBACK_STATUS="declined"
+        return 0
+    fi
+
+    FALLBACK_STATUS="selected"
+    return 0
 }
 
 download_appimage() {
@@ -307,8 +367,21 @@ main() {
     fi
 
     if [[ -z "$version" ]]; then
-        gum log --level error "Could not find a $VARIANT release."
-        exit 1
+        if fallback_to_nightly_if_needed; then
+            version="$FALLBACK_VERSION"
+            if [[ "$FALLBACK_ALREADY_INSTALLED" == "true" && "$FORCE" != "true" ]]; then
+                gum log --level info "No stable release upstream. Latest nightly already installed ($version). Nothing to do."
+                exit 0
+            fi
+            if [[ "$FALLBACK_STATUS" == "declined" ]]; then
+                gum log --level info "No stable release upstream. Nightly install cancelled."
+                exit 0
+            fi
+            gum log --level info "Installing version: $version"
+        else
+            gum log --level error "Could not find a $VARIANT release."
+            exit 1
+        fi
     fi
 
     if [[ "$select_mode" != "true" && -z "$arg" ]]; then
