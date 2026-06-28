@@ -1,8 +1,8 @@
 #!/usr/bin/bash
 
 if [[ "$1" == "--vscode" ]]; then
-	convert "$2" -blur 40x20 "$3"
+	magick "$2" -blur 40x20 "$3"
 
 else
-	convert "$1" -blur 0x30 "$2"
+	magick "$1" -blur 0x30 "$2"
 fi

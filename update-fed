@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-STEPS=("dnf" "flatpak" "snap" "npm" "pnpm" "bun" "rustup" "cargo" "uv" "opencode")
+STEPS=("dnf" "flatpak" "snap" "npm" "pnpm" "bun" "rustup" "cargo" "uv" "opencode" "pi" "codex")
 
 run_step() {
   case "$1" in
@@ -14,6 +14,8 @@ run_step() {
     cargo)    cargo update ;;
     uv)       uv self update ;;
     opencode) opencode upgrade ;;
+    pi)       pi update ;;
+    codex)    codex update ;;
   esac
 }
 

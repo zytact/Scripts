@@ -2,14 +2,16 @@
 set -euo pipefail
 
 MODE="pretty"
+REPORT="usage"
 
 usage() {
   cat <<'EOF'
-Usage: codex-usage [--json|--shell]
+Usage: codex-usage [--json|--shell] [--resets]
 
 Options:
-  --json   Print machine-readable JSON instead of the formatted dashboard
-  --shell  Print shell-friendly KEY=VALUE lines
+  --json    Print machine-readable JSON instead of the formatted dashboard
+  --shell   Print shell-friendly KEY=VALUE lines
+  --resets  Show available reset credits and exact expiry times
   -h, --help
 EOF
 }
@@ -22,6 +24,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --shell)
       MODE="shell"
+      shift
+      ;;
+    --resets|--reset-credits)
+      REPORT="resets"
       shift
       ;;
     -h|--help)
@@ -180,8 +186,150 @@ fetch_usage() {
   fi
 }
 
+fetch_reset_credits() {
+  local url="https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+
+  if [[ -n "$ACCOUNT_ID" && "$ACCOUNT_ID" != "null" ]]; then
+    curl -fsS "$url" \
+      -H "Authorization: Bearer $ACCESS_TOKEN" \
+      -H "chatgpt-account-id: $ACCOUNT_ID" \
+      -H "accept: application/json" \
+      -H "OpenAI-Beta: codex-1" \
+      -H "User-Agent: codex-usage/1.0" \
+      -H "originator: Codex Desktop"
+  else
+    curl -fsS "$url" \
+      -H "Authorization: Bearer $ACCESS_TOKEN" \
+      -H "accept: application/json" \
+      -H "OpenAI-Beta: codex-1" \
+      -H "User-Agent: codex-usage/1.0" \
+      -H "originator: Codex Desktop"
+  fi
+}
+
+parse_time_to_epoch() {
+  local value="$1"
+
+  if [[ -z "$value" || "$value" == "null" ]]; then
+    echo ""
+    return
+  fi
+
+  if [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    value="${value%.*}"
+    if (( value > 100000000000 )); then
+      echo $(( value / 1000 ))
+    else
+      echo "$value"
+    fi
+    return
+  fi
+
+  date -d "$value" +%s 2>/dev/null && return
+
+  local bsd_value="${value/Z/+0000}"
+  if [[ "$bsd_value" =~ ^(.*T[0-9]{2}:[0-9]{2}:[0-9]{2})\.[0-9]+([+-][0-9]{2}:?[0-9]{2})$ ]]; then
+    bsd_value="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+  fi
+  if [[ "$bsd_value" =~ ^(.*)([+-][0-9]{2}):([0-9]{2})$ ]]; then
+    bsd_value="${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
+  fi
+  date -j -f "%Y-%m-%dT%H:%M:%S%z" "$bsd_value" +%s 2>/dev/null || echo ""
+}
+
+fmt_abs_time_from_epoch() {
+  local epoch="$1"
+
+  if [[ -z "$epoch" || "$epoch" == "null" ]]; then
+    echo "unknown"
+    return
+  fi
+
+  date -d "@$epoch" "+%Y-%m-%d %I:%M:%S %p %Z" 2>/dev/null \
+    || date -r "$epoch" "+%Y-%m-%d %I:%M:%S %p %Z"
+}
+
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
+
+if [[ "$REPORT" == "resets" ]]; then
+  if ! fetch_reset_credits > "$TMP"; then
+    echo "Reset credits request failed."
+    exit 1
+  fi
+
+  RESET_COUNT="$(jq -r '(.available_count // ((.credits // .data // .items // []) | length))' "$TMP")"
+  RESET_LABEL="resets"
+  [[ "$RESET_COUNT" == "1" ]] && RESET_LABEL="reset"
+  now_epoch="$(date +%s)"
+
+  if [[ "$MODE" == "json" ]]; then
+    jq -n \
+      --argjson now_epoch "$now_epoch" \
+      --argjson available_count "$RESET_COUNT" \
+      --slurpfile payload "$TMP" \
+      '{
+        now_epoch: $now_epoch,
+        available_count: $available_count,
+        credits: (($payload[0].credits // $payload[0].data // $payload[0].items // []) | map({
+          expires_at: (.expires_at // .expiresAt // .expiry // .expires // .expiration // .expiration_at // null)
+        }))
+      }'
+    exit 0
+  fi
+
+  if [[ "$MODE" == "shell" ]]; then
+    echo "NOW_EPOCH=$now_epoch"
+    echo "RESET_CREDITS_AVAILABLE=$RESET_COUNT"
+
+    index=1
+    while IFS=$'\t' read -r expires; do
+      epoch="$(parse_time_to_epoch "$expires")"
+      echo "RESET_${index}_EXPIRES_RAW=$expires"
+      echo "RESET_${index}_EXPIRES_EPOCH=$epoch"
+      index=$(( index + 1 ))
+    done < <(jq -r '
+      (.credits // .data // .items // [])[]
+      | (.expires_at // .expiresAt // .expiry // .expires // .expiration // .expiration_at // "")
+    ' "$TMP")
+    exit 0
+  fi
+
+  printf '\n'
+  echo "${BOLD}${BRIGHT_CYAN}╔══════════════════════════════╗${RESET}"
+  echo "${BOLD}${BRIGHT_CYAN}║      CODEX RESET CREDITS     ║${RESET}"
+  echo "${BOLD}${BRIGHT_CYAN}╚══════════════════════════════╝${RESET}"
+  echo "  ${DIM}$(date '+%a, %d %b %Y %I:%M %p %Z')${RESET}"
+  echo
+  echo "  ${DIM}Available${RESET} ${BRIGHT_GREEN}${BOLD}${RESET_COUNT} ${RESET_LABEL}${RESET}"
+  echo
+
+  if (( RESET_COUNT == 0 )); then
+    echo "${BRIGHT_YELLOW}No reset credits found.${RESET}"
+    exit 0
+  fi
+
+  printf "  ${DIM}%-4s %-24s %-14s${RESET}\n" "#" "Expires" "Time left"
+  printf "  ${DIM}%-4s %-24s %-14s${RESET}\n" "----" "------------------------" "--------------"
+
+  index=1
+  while IFS=$'\t' read -r expires; do
+    epoch="$(parse_time_to_epoch "$expires")"
+    time_left="unknown"
+    if [[ -n "$epoch" ]]; then
+      time_left="$(fmt_eta "$(( epoch - now_epoch ))")"
+    fi
+    printf "  ${BOLD}%-4s${RESET} ${BRIGHT_BLUE}%-24s${RESET} ${BRIGHT_GREEN}%-14s${RESET}\n" \
+      "$index" "$(fmt_abs_time_from_epoch "$epoch")" "$time_left"
+    index=$(( index + 1 ))
+  done < <(jq -r '
+    (.credits // .data // .items // [])[]
+    | (.expires_at // .expiresAt // .expiry // .expires // .expiration // .expiration_at // "")
+  ' "$TMP")
+
+  echo
+  exit 0
+fi
 
 if ! fetch_usage "https://chatgpt.com/backend-api/wham/usage" > "$TMP"; then
   if ! fetch_usage "https://chatgpt.com/backend-api/codex/usage" > "$TMP"; then
